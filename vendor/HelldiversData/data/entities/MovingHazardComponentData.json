@@ -1,0 +1,30 @@
+{
+  "14005216303325302728": {
+    "move_speed": 2,
+    "height_change_speed": 1,
+    "life_time_range": {
+      "x": 90,
+      "y": 90
+    },
+    "random_goal_range": {
+      "x": 35,
+      "y": 90
+    },
+    "random_goal_offset": 80,
+    "goal_distance": 5
+  },
+  "4298962299928679023": {
+    "move_speed": 5,
+    "height_change_speed": 5,
+    "life_time_range": {
+      "x": 60,
+      "y": 60
+    },
+    "random_goal_range": {
+      "x": 60,
+      "y": 120
+    },
+    "random_goal_offset": 180,
+    "goal_distance": 5
+  }
+}

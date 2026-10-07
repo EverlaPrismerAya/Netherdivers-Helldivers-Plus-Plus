@@ -1,0 +1,1353 @@
+package geometry
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+
+	"github.com/qmuntal/gltf"
+	"github.com/qmuntal/gltf/modeler"
+	"github.com/x448/float16"
+
+	"github.com/go-gl/mathgl/mgl32"
+
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/extractor"
+	extr_material "github.com/xypwn/filediver/extractor/material"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/unit"
+)
+
+type MeshInfo struct {
+	Groups          []unit.MeshGroup
+	Materials       []stingray.ThinHash
+	MeshLayoutIndex uint32
+}
+
+type AccessorInfo struct {
+	gltf.AccessorType
+	gltf.ComponentType
+	Size uint32
+}
+
+type MaterialVariantMap struct {
+	Name                string
+	MaterialHashToIndex map[stingray.ThinHash]uint32
+}
+
+var fibonacciLut [][]mgl32.Vec3
+
+func InitFibonacciLut(ctx *extractor.Context) error {
+	if fibonacciLut != nil {
+		return nil
+	}
+	r, err := ctx.Open(stingray.NewFileID(stingray.Sum("content/art_shared/textures/fibonacci_normal_lut"), stingray.Sum("texture")), stingray.DataGPU)
+	if err != nil {
+		return err
+	}
+	fibonacciLut = make([][]mgl32.Vec3, 0)
+	for range 16 {
+		row := make([]mgl32.Vec3, 0)
+		for range 16 {
+			var pixel mgl32.Vec4
+			if err := binary.Read(r, binary.LittleEndian, &pixel); err != nil {
+				return err
+			}
+			row = append(row, pixel.Vec3())
+		}
+		fibonacciLut = append(fibonacciLut, row)
+	}
+	return nil
+}
+
+func convertFibonacciNormal(value uint8) mgl32.Vec3 {
+	return fibonacciLut[value>>4][value&0xf]
+}
+
+func convertFloat16Slice(gpuR io.ReadSeeker, data []byte, tmpArr []uint16, extra uint32) ([]byte, uint32, error) {
+	var err error
+	if err = binary.Read(gpuR, binary.LittleEndian, &tmpArr); err != nil {
+		return nil, 0, err
+	}
+	var size uint32 = extra * 4
+	for _, tmp := range tmpArr {
+		data, err = binary.Append(data, binary.LittleEndian, float16.Frombits(tmp).Float32())
+		if err != nil {
+			return nil, 0, err
+		}
+		size += 4
+	}
+	data = append(data, make([]byte, extra*4)...)
+	return data, size, nil
+}
+
+// 32-bit abs
+func abs32(f float32) float32 {
+	// See std math.Abs.
+	return math.Float32frombits(math.Float32bits(f) &^ (1 << 31))
+}
+
+func calcTangent(normal mgl32.Vec4) mgl32.Vec4 {
+	tangentBaseChoice := abs32(normal.Z()) < abs32(normal.Y())
+
+	// The following if statement is NOT in the actual shader.
+	// This is to correct some special cases, which probably
+	// came to be because the shader uses float16 and we're
+	// using float32.
+	if mgl32.FloatEqualThreshold(normal.X(), -1, 1e-6) ||
+		mgl32.FloatEqualThreshold(normal.X(), 1, 1e-6) {
+		tangentBaseChoice = !tangentBaseChoice
+	}
+
+	var tangent mgl32.Vec3 // tangentBase is orthogonal to normal
+	if tangentBaseChoice {
+		tangent = (mgl32.Vec3{normal.Y(), -normal.X(), 0}).Normalize()
+	} else {
+		tangent = (mgl32.Vec3{normal.Z(), 0, -normal.X()}).Normalize()
+	}
+
+	return tangent.Vec4(normal.W())
+}
+
+func ConvertVertices(gpuR io.ReadSeeker, layout unit.MeshLayout) ([]byte, [][]AccessorInfo, error) {
+	data := make([]byte, 0)
+	dataLen := len(data)
+	accessorStructure := make([][]AccessorInfo, 0, layout.NumItems)
+	if _, err := gpuR.Seek(int64(layout.VertexOffset), io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	for vertex := 0; vertex < int(layout.NumVertices); vertex += 1 {
+		for idx := 0; idx < int(layout.NumItems); idx += 1 {
+			item := layout.Items[idx]
+			if item.Type == unit.ItemIgnore {
+				_, err := gpuR.Seek(int64(item.Format.Size()), io.SeekCurrent)
+				if err != nil {
+					return nil, nil, err
+				}
+				if vertex == 0 {
+					accessorInfos := []AccessorInfo{}
+					accessorStructure = append(accessorStructure, accessorInfos)
+				}
+				continue
+			}
+			switch item.Format {
+			case unit.FormatVec4R10G10B10A2_TYPELESS:
+				var tmp uint32
+				var val [4]float32
+				var err error
+				if err = binary.Read(gpuR, binary.LittleEndian, &tmp); err != nil {
+					return nil, nil, fmt.Errorf("reading gpu data: %v", err)
+				}
+				val[0] = float32(tmp&0x3ff) / 1023.0
+				val[1] = float32((tmp>>10)&0x3ff) / 1023.0
+				val[2] = float32((tmp>>20)&0x3ff) / 1023.0
+				val[3] = 0.0 // float32((tmp>>30)&0x3) / 3.0 // This causes issues with incorrect bone weights
+				data, err = binary.Append(data, binary.LittleEndian, val)
+				if err != nil {
+					return nil, nil, fmt.Errorf("adding packed vec4 typeless to data: %v", err)
+				}
+				if vertex == 0 {
+					accessorStructure = append(accessorStructure, []AccessorInfo{{
+						AccessorType:  gltf.AccessorVec4,
+						ComponentType: gltf.ComponentFloat,
+						Size:          16,
+					}})
+				}
+			case unit.FormatVec4R10G10B10A2_UNORM:
+				var tmp uint32
+				var err error
+				if err = binary.Read(gpuR, binary.LittleEndian, &tmp); err != nil {
+					return nil, nil, fmt.Errorf("reading gpu data: %v", err)
+				}
+				normal, tangent, _ := unit.DecodePackedNormal(tmp)
+				data, err = binary.Append(data, binary.LittleEndian, struct {
+					N mgl32.Vec3
+					T mgl32.Vec4
+				}{
+					N: normal,
+					T: tangent,
+				})
+				if err != nil {
+					return nil, nil, fmt.Errorf("adding packed vec4 unorm to data: %v", err)
+				}
+				if vertex == 0 {
+					accessorStructure = append(accessorStructure, []AccessorInfo{{
+						// Normal
+						AccessorType:  gltf.AccessorVec3,
+						ComponentType: gltf.ComponentFloat,
+						Size:          12,
+					}, {
+						// Tangent (XYZ) + bitangent direction (W)
+						AccessorType:  gltf.AccessorVec4,
+						ComponentType: gltf.ComponentFloat,
+						Size:          16,
+					}})
+				}
+			case unit.FormatF16:
+				fallthrough
+			case unit.FormatVec2F16:
+				fallthrough
+			case unit.FormatVec3F16:
+				fallthrough
+			case unit.FormatVec4F16:
+				tmpArr := make([]uint16, item.Format.Type().Components())
+				var err error
+				var size, extra uint32
+				var accessorType gltf.AccessorType = item.Format.Type()
+				if item.Type == unit.ItemBoneWeight && item.Format == unit.FormatVec2F16 {
+					accessorType = gltf.AccessorVec4
+					extra = 2
+				}
+				data, size, err = convertFloat16Slice(gpuR, data, tmpArr, extra)
+				if err != nil {
+					return nil, nil, fmt.Errorf("converting float16 slice: %v", err)
+				}
+				if item.Type == unit.ItemNormal && item.Format == unit.FormatVec4F16 {
+					tmpFloats := make([]float32, item.Format.Type().Components())
+					_, err := binary.Decode(data[len(data)-int(size):], binary.LittleEndian, &tmpFloats)
+					if err != nil {
+						return nil, nil, fmt.Errorf("converting float16 normal slice: %v", err)
+					}
+					data = data[:len(data)-int(size)]
+					data, err = binary.Append(data, binary.LittleEndian, tmpFloats[:3])
+					tangent := calcTangent(mgl32.Vec4(tmpFloats))
+					data, err = binary.Append(data, binary.LittleEndian, tangent)
+				}
+				if item.Type == unit.ItemSpeedTreeNormalYZ {
+					normalX := data[len(data)-20 : len(data)-16]
+					normalYZ := data[len(data)-8:]
+					texcoords := data[len(data)-16 : len(data)-8]
+					data = data[:len(data)-20]
+					data = append(data, texcoords...)
+					data = append(data, normalX...)
+					data = append(data, normalYZ...)
+				}
+				if vertex == 0 {
+					accessorInfos := []AccessorInfo{{
+						AccessorType:  accessorType,
+						ComponentType: gltf.ComponentFloat,
+						Size:          size,
+					}}
+					if item.Type == unit.ItemNormal && item.Format == unit.FormatVec4F16 {
+						accessorInfos[0].AccessorType = gltf.AccessorVec3
+						accessorInfos[0].Size = 12
+						accessorInfos = append(accessorInfos, AccessorInfo{
+							AccessorType:  gltf.AccessorVec4,
+							ComponentType: gltf.ComponentFloat,
+							Size:          16,
+						})
+					} else if item.Type == unit.ItemSpeedTreeNormalYZ {
+						accessorInfos[0].AccessorType = gltf.AccessorVec3
+						accessorInfos[0].Size = 12
+					} else if item.Type == unit.ItemSpeedTreeU {
+						accessorInfos[0].AccessorType = gltf.AccessorVec2
+						accessorInfos[0].Size = 8
+					} else if item.Type == unit.ItemSpeedTreeNormalX || item.Type == unit.ItemSpeedTreeV {
+						accessorInfos[0].Size = 0
+					}
+					accessorStructure = append(accessorStructure, accessorInfos)
+				}
+			case unit.FormatF32:
+				fallthrough
+			case unit.FormatVec2F:
+				fallthrough
+			case unit.FormatVec3F:
+				fallthrough
+			case unit.FormatVec4F:
+				fallthrough
+			case unit.FormatRGBA8:
+				fallthrough
+			case unit.FormatS8:
+				fallthrough
+			case unit.FormatVec2S8:
+				fallthrough
+			case unit.FormatVec3S8:
+				fallthrough
+			case unit.FormatVec4S8:
+				fallthrough
+			case unit.FormatU32:
+				fallthrough
+			case unit.FormatVec2U32:
+				fallthrough
+			case unit.FormatVec3U32:
+				fallthrough
+			case unit.FormatVec4U32:
+				data = append(data, make([]byte, item.Format.Size())...)
+				if _, err := gpuR.Read(data[dataLen:]); err != nil {
+					return nil, nil, fmt.Errorf("reading gpu data: %v", err)
+				}
+				if item.Type == unit.ItemBoneWeight && item.Format == unit.FormatF32 {
+					var err error
+					data, err = binary.Append(data, binary.LittleEndian, [3]float32{})
+					if err != nil {
+						return nil, nil, fmt.Errorf("adding bone weight: %v", err)
+					}
+					item.Format = unit.FormatVec4F
+				}
+				if item.Type == unit.ItemNormal && item.Format == unit.FormatVec4F {
+					tmpFloats := make([]float32, item.Format.Type().Components())
+					_, err := binary.Decode(data[len(data)-16:], binary.LittleEndian, &tmpFloats)
+					if err != nil {
+						return nil, nil, fmt.Errorf("converting float16 normal slice: %v", err)
+					}
+					data = data[:len(data)-16]
+					data, err = binary.Append(data, binary.LittleEndian, tmpFloats[:3])
+					tangent := calcTangent(mgl32.Vec4(tmpFloats))
+					data, err = binary.Append(data, binary.LittleEndian, tangent)
+				}
+				if (item.Type == unit.ItemNormal || item.Type == unit.ItemTangent) && item.Format == unit.FormatS8 {
+					// Fibonacci normals/tangents used by speed tree format
+					normal := convertFibonacciNormal(data[len(data)-1])
+					data = data[:len(data)-1]
+					data, _ = binary.Append(data, binary.LittleEndian, normal[:])
+					if item.Type == unit.ItemTangent {
+						data, _ = binary.Append(data, binary.LittleEndian, float32(1.0))
+					}
+				}
+				if vertex == 0 {
+					accessorInfos := []AccessorInfo{{
+						AccessorType:  item.Format.Type(),
+						ComponentType: item.Format.ComponentType(),
+						Size:          uint32(item.Format.Size()),
+					}}
+					if item.Type == unit.ItemNormal && item.Format == unit.FormatVec4F {
+						accessorInfos[0].AccessorType = gltf.AccessorVec3
+						accessorInfos[0].Size = 12
+						accessorInfos = append(accessorInfos, AccessorInfo{
+							AccessorType:  gltf.AccessorVec4,
+							ComponentType: gltf.ComponentFloat,
+							Size:          16,
+						})
+					} else if item.Type == unit.ItemNormal && item.Format == unit.FormatS8 {
+						accessorInfos[0].AccessorType = gltf.AccessorVec3
+						accessorInfos[0].ComponentType = gltf.ComponentFloat
+						accessorInfos[0].Size = 12
+					} else if item.Type == unit.ItemTangent && item.Format == unit.FormatS8 {
+						accessorInfos[0].AccessorType = gltf.AccessorVec4
+						accessorInfos[0].ComponentType = gltf.ComponentFloat
+						accessorInfos[0].Size = 16
+					}
+					accessorStructure = append(accessorStructure, accessorInfos)
+				}
+			default:
+				return nil, nil, fmt.Errorf("Unknown format %v for type %v", item.Format.String(), item.Type.String())
+			}
+			dataLen = len(data)
+		}
+	}
+	return data, accessorStructure, nil
+}
+
+func GetMeshNameFbxConvertAndTransformBone(unitInfo *unit.Info, groupBoneHash stingray.ThinHash) (meshNameBoneIdx int, fbxConvertIdx int, transformBoneIdx int) {
+	parentIdx := -1
+	fbxConvertIdx = -1
+	meshNameBoneIdx = -1
+	transformBoneIdx = -1
+	gameMeshHash := stingray.Sum("game_mesh").Thin()
+	fbxConvertHash := stingray.Sum("FbxAxisSystem_ConvertNode").Thin()
+	for boneIdx, bone := range unitInfo.Bones {
+		if bone.NameHash == gameMeshHash {
+			parentIdx = boneIdx
+		}
+		if bone.NameHash == fbxConvertHash {
+			fbxConvertIdx = boneIdx
+		}
+		if bone.ParentIndex == uint32(parentIdx) && bone.NameHash == groupBoneHash {
+			transformBoneIdx = boneIdx
+		}
+		if bone.ParentIndex == uint32(fbxConvertIdx) {
+			meshNameBoneIdx = boneIdx
+		}
+	}
+	return
+}
+
+func remapJoint[E ~[]I, I uint8 | uint32](idxs E, remapList, remappedBoneIndices []uint32) {
+	for k := range 4 {
+		if uint32(idxs[k]) >= uint32(len(remapList)) {
+			continue
+		}
+		remapIndex := remapList[idxs[k]]
+		idxs[k] = I(remappedBoneIndices[remapIndex])
+	}
+}
+
+func remapJoints(buffer *gltf.Buffer, stride, bufferOffset, vertexCount uint32, indices []uint32, componentType gltf.ComponentType, remapList, remappedBoneIndices []uint32) error {
+	remappedVertices := make(map[uint32]bool)
+	for _, vertex := range indices {
+		var size uint32 = 4
+		if componentType != gltf.ComponentUbyte {
+			size = 16
+		}
+		if vertex >= vertexCount && stride*vertex+bufferOffset+size >= buffer.ByteLength {
+			// Skip the vertex if its both larger than the vertex count _and_ would cause an error if we modified it
+			// cause apparently stingray doesn't respect the bounds it imposes on the number of vertices a mesh contains
+			// (╯°□°)╯︵ ┻━┻
+			continue
+		}
+		if _, contains := remappedVertices[vertex]; contains {
+			continue
+		}
+		remappedVertices[vertex] = true
+		if componentType == gltf.ComponentUbyte {
+			boneIndices := make([]uint8, 4)
+			if _, err := binary.Decode(buffer.Data[stride*vertex+bufferOffset:], binary.LittleEndian, &boneIndices); err != nil {
+				return err
+			}
+			remapJoint(boneIndices, remapList, remappedBoneIndices)
+			if _, err := binary.Encode(buffer.Data[stride*vertex+bufferOffset:], binary.LittleEndian, boneIndices); err != nil {
+				return err
+			}
+		} else {
+			boneIndices := make([]uint32, 4)
+			if _, err := binary.Decode(buffer.Data[stride*vertex+bufferOffset:], binary.LittleEndian, &boneIndices); err != nil {
+				return err
+			}
+			remapJoint(boneIndices, remapList, remappedBoneIndices)
+			if _, err := binary.Encode(buffer.Data[stride*vertex+bufferOffset:], binary.LittleEndian, boneIndices); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func AddMeshLayoutVertexBuffer(doc *gltf.Document, data []byte, accessorInfo [][]AccessorInfo) (uint32, error) {
+	ensurePadding(doc)
+	buffer := lastBuffer(doc)
+	buffer = ensureCapacity(doc, buffer, uint64(len(data)))
+	offset := uint32(len(buffer.Data))
+
+	buffer.Data = append(buffer.Data, data...)
+	buffer.ByteLength += uint32(len(data))
+	convertedVertexStride := uint32(0)
+	for i := range accessorInfo {
+		for j := range accessorInfo[i] {
+			convertedVertexStride += accessorInfo[i][j].Size
+		}
+	}
+
+	doc.BufferViews = append(doc.BufferViews, &gltf.BufferView{
+		Buffer:     uint32(len(doc.Buffers)) - 1,
+		ByteLength: uint32(len(data)),
+		ByteOffset: offset,
+		ByteStride: convertedVertexStride,
+		Target:     gltf.TargetArrayBuffer,
+	})
+
+	return uint32(len(doc.BufferViews) - 1), nil
+}
+
+func CreateAttributes(doc *gltf.Document, layout unit.MeshLayout, accessorInfo [][]AccessorInfo) map[string]*gltf.Accessor {
+	attributes := make(map[string]*gltf.Accessor)
+
+	var byteOffset uint32 = 0
+	for itemIdx := 0; itemIdx < int(layout.NumItems); itemIdx++ {
+		if layout.Items[itemIdx].Type == unit.ItemBoneIdx && layout.Items[itemIdx].Layer != 0 {
+			continue
+		}
+		if layout.Items[itemIdx].Type == unit.ItemSpeedTreeNormalX {
+			continue
+		}
+		if layout.Items[itemIdx].Type == unit.ItemSpeedTreeV {
+			continue
+		}
+		if layout.Items[itemIdx].Type == unit.ItemIgnore {
+			continue
+		}
+
+		// A stingray item maps to one or more glTF accessors
+		accessors := make([]*gltf.Accessor, len(accessorInfo[itemIdx]))
+		for i := range accessorInfo[itemIdx] {
+			info := accessorInfo[itemIdx][i]
+			accessors[i] = &gltf.Accessor{
+				BufferView:    gltf.Index(uint32(len(doc.BufferViews)) - 1),
+				ByteOffset:    uint32(byteOffset),
+				ComponentType: info.ComponentType,
+				Type:          info.AccessorType,
+				Count:         layout.NumVertices,
+			}
+			byteOffset += info.Size
+		}
+
+		switch layout.Items[itemIdx].Type {
+		case unit.ItemPosition:
+			attributes[gltf.POSITION] = accessors[0]
+		case unit.ItemSpeedTreeNormalYZ:
+			attributes[gltf.NORMAL] = accessors[0]
+		case unit.ItemNormal:
+			attributes[gltf.NORMAL] = accessors[0]
+			if layout.Items[itemIdx].Format != unit.FormatS8 {
+				attributes[gltf.TANGENT] = accessors[1]
+			}
+		case unit.ItemTangent:
+			attributes[gltf.TANGENT] = accessors[0]
+		case unit.ItemUVCoords, unit.ItemSpeedTreeU:
+			attributes[fmt.Sprintf("TEXCOORD_%v", layout.Items[itemIdx].Layer)] = accessors[0]
+		case unit.ItemColor:
+			attributes[fmt.Sprintf("COLOR_%v", layout.Items[itemIdx].Layer)] = accessors[0]
+		case unit.ItemBoneIdx:
+			attributes[fmt.Sprintf("JOINTS_%v", layout.Items[itemIdx].Layer)] = accessors[0]
+		case unit.ItemBoneWeight:
+			attributes[fmt.Sprintf("WEIGHTS_%v", layout.Items[itemIdx].Layer)] = accessors[0]
+		}
+	}
+	return attributes
+}
+
+func LoadMeshLayoutIndices(gpuR io.ReadSeeker, doc *gltf.Document, layout unit.MeshLayout) (*gltf.Accessor, error) {
+	ensurePadding(doc)
+	buffer := lastBuffer(doc)
+	buffer = ensureCapacity(doc, buffer, uint64(layout.IndicesSize))
+	dataOffset := uint32(len(buffer.Data))
+	buffer.ByteLength += layout.IndicesSize
+	buffer.Data = append(buffer.Data, make([]byte, layout.IndicesSize)...)
+	if _, err := gpuR.Seek(int64(layout.IndexOffset), io.SeekStart); err != nil {
+		return nil, err
+	}
+	var read int
+	var err error
+	if read, err = gpuR.Read(buffer.Data[dataOffset:]); err != nil {
+		return nil, err
+	}
+	if read != int(layout.IndicesSize) {
+		return nil, fmt.Errorf("Read an unexpected amount of data when copying geometry group indices - expected %v bytes, got %v bytes", layout.IndicesSize, read)
+	}
+
+	indexStride := layout.IndicesSize / layout.NumIndices
+	indexType := gltf.ComponentUshort
+	if indexStride == 4 {
+		indexType = gltf.ComponentUint
+	}
+
+	doc.BufferViews = append(doc.BufferViews, &gltf.BufferView{
+		Buffer:     uint32(len(doc.Buffers)) - 1,
+		ByteLength: layout.IndicesSize,
+		ByteOffset: dataOffset,
+		Target:     gltf.TargetElementArrayBuffer,
+	})
+
+	return &gltf.Accessor{
+		BufferView:    gltf.Index(uint32(len(doc.BufferViews)) - 1),
+		ByteOffset:    0,
+		ComponentType: indexType,
+		Type:          gltf.AccessorScalar,
+		Count:         layout.NumIndices,
+	}, nil
+}
+
+func getMaxIndex(buffer *gltf.Buffer, offset, indexCount uint32, componentType gltf.ComponentType) (uint32, error) {
+	max := uint32(0)
+	if componentType == gltf.ComponentUshort {
+		var indexSlice []uint16 = make([]uint16, indexCount)
+		_, err := binary.Decode(buffer.Data[offset:], binary.LittleEndian, &indexSlice)
+		if err != nil {
+			return 0, err
+		}
+		for _, idx := range indexSlice {
+			if uint32(idx) > max {
+				max = uint32(idx)
+			}
+		}
+	} else {
+		var indexSlice []uint32 = make([]uint32, indexCount)
+		_, err := binary.Decode(buffer.Data[offset:], binary.LittleEndian, &indexSlice)
+		if err != nil {
+			return 0, err
+		}
+		for _, idx := range indexSlice {
+			if idx > max {
+				max = idx
+			}
+		}
+	}
+	return max, nil
+}
+
+func addPositionMinMax(doc *gltf.Document, transformMatrix mgl32.Mat4, min, max mgl32.Vec3, accessor uint32) {
+	minTransformed := transformMatrix.Mul4x1(min.Vec4(1)).Vec3()
+	maxTransformed := transformMatrix.Mul4x1(max.Vec4(1)).Vec3()
+	doc.Accessors[accessor].Min = minTransformed[:]
+	doc.Accessors[accessor].Max = maxTransformed[:]
+	for k := 0; k < 3; k++ {
+		if doc.Accessors[accessor].Min[k] > doc.Accessors[accessor].Max[k] {
+			temp := doc.Accessors[accessor].Max[k]
+			doc.Accessors[accessor].Max[k] = doc.Accessors[accessor].Min[k]
+			doc.Accessors[accessor].Min[k] = temp
+		}
+	}
+}
+
+func TransformVertices(buffer *gltf.Buffer, bufferOffset, stride, vertexOffset, vertexCount uint32, transformMatrix mgl32.Mat4) error {
+	for vertex := vertexOffset; vertex < vertexCount; vertex += 1 {
+		var position mgl32.Vec3
+		if _, err := binary.Decode(buffer.Data[vertex*stride+bufferOffset:], binary.LittleEndian, &position); err != nil {
+			return err
+		}
+		position = transformMatrix.Mul4x1(position.Vec4(1)).Vec3()
+		if _, err := binary.Encode(buffer.Data[vertex*stride+bufferOffset:], binary.LittleEndian, position); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func AddGroupAttributes(doc *gltf.Document, group unit.MeshGroup, groupLayoutAttributes map[string]*gltf.Accessor, vertexBuffer, maxIndex uint32) (gltf.Attribute, error) {
+	groupAttr := make(gltf.Attribute)
+	for key, layoutAttrAccessor := range groupLayoutAttributes {
+		doc.Accessors = append(doc.Accessors, &gltf.Accessor{
+			BufferView:    gltf.Index(vertexBuffer),
+			ByteOffset:    layoutAttrAccessor.ByteOffset + doc.BufferViews[vertexBuffer].ByteStride*group.VertexOffset,
+			ComponentType: layoutAttrAccessor.ComponentType,
+			Type:          layoutAttrAccessor.Type,
+			Count:         group.NumVertices,
+		})
+		accessor := doc.Accessors[len(doc.Accessors)-1]
+		if (maxIndex + 1) > accessor.Count {
+			accessor.Count = uint32(maxIndex + 1)
+		}
+		groupAttr[key] = uint32(len(doc.Accessors)) - 1
+	}
+	return groupAttr, nil
+}
+
+// Flips normals by reversing the winding order of vertices
+func flipNormals(buffer *gltf.Buffer, componentType gltf.ComponentType, indexCount, bufferOffset uint32) error {
+	var indexSlice interface{}
+	if componentType == gltf.ComponentUshort {
+		indexSlice = make([]uint16, indexCount)
+	} else {
+		indexSlice = make([]uint32, indexCount)
+	}
+	if _, err := binary.Decode(buffer.Data[bufferOffset:], binary.LittleEndian, &indexSlice); err != nil {
+		return err
+	}
+	if componentType == gltf.ComponentUshort {
+		slices.Reverse(indexSlice.([]uint16))
+	} else {
+		slices.Reverse(indexSlice.([]uint32))
+	}
+	if _, err := binary.Encode(buffer.Data[bufferOffset:], binary.LittleEndian, indexSlice); err != nil {
+		return err
+	}
+	return nil
+}
+
+func separateUDims(doc *gltf.Document, indexAccessor, texcoordAccessor *gltf.Accessor, matName string) (map[uint32][]uint32, error) {
+	indexBufferView := doc.BufferViews[*indexAccessor.BufferView]
+	buffer := doc.Buffers[indexBufferView.Buffer]
+	indexSlice, err := getIndices(buffer, indexBufferView, indexAccessor)
+	if err != nil {
+		return nil, err
+	}
+
+	texcoordOffset := texcoordAccessor.ByteOffset + doc.BufferViews[*texcoordAccessor.BufferView].ByteOffset
+	vertexStride := doc.BufferViews[*texcoordAccessor.BufferView].ByteStride
+	buffer = doc.Buffers[doc.BufferViews[*texcoordAccessor.BufferView].Buffer]
+
+	UDIMs := make(map[uint32][]uint32)
+	for i := uint32(0); i+2 < uint32(len(indexSlice)); i += 3 {
+		var uv [2]float32
+		vertex := indexSlice[i]
+		if _, err := binary.Decode(buffer.Data[vertex*vertexStride+texcoordOffset:], binary.LittleEndian, &uv); err != nil {
+			return nil, err
+		}
+
+		udim := make([]uint32, 3)
+		if uv[1] < 0 && matName != "m_tracks_01" {
+			udim[0] = uint32(math.Max(float64(uv[0]), 0.0)) | uint32(1-uv[1])<<5
+		} else {
+			// include all negative v values in the udim with v == 0
+			// Also make the bastion tracks stay on the first udim
+			udim[0] = uint32(math.Max(float64(uv[0]), 0.0))
+		}
+		for j := i + 1; j < i+3; j += 1 {
+			vertex := indexSlice[j]
+			if _, err := binary.Decode(buffer.Data[vertex*vertexStride+texcoordOffset:], binary.LittleEndian, &uv); err != nil {
+				return nil, err
+			}
+			if uv[1] < 0 {
+				udim[j-i] = uint32(math.Max(float64(uv[0]), 0.0)) | uint32(1-uv[1])<<5
+			} else {
+				udim[j-i] = uint32(math.Max(float64(uv[0]), 0.0))
+			}
+		}
+		var minUdim uint32
+		if udim[0] < udim[1] && udim[0] < udim[2] {
+			minUdim = udim[0]
+		} else if udim[1] < udim[2] {
+			minUdim = udim[1]
+		} else {
+			minUdim = udim[2]
+		}
+		UDIMs[minUdim] = append(UDIMs[minUdim], indexSlice[i], indexSlice[i+1], indexSlice[i+2])
+	}
+
+	return UDIMs, nil
+}
+
+func getIndices(buffer *gltf.Buffer, bufferView *gltf.BufferView, idxAccessor *gltf.Accessor) ([]uint32, error) {
+	idxBufferOffset := idxAccessor.ByteOffset + bufferView.ByteOffset
+	indices := make([]uint32, idxAccessor.Count)
+	if idxAccessor.ComponentType == gltf.ComponentUshort {
+		temp := make([]uint16, idxAccessor.Count)
+		if _, err := binary.Decode(buffer.Data[idxBufferOffset:], binary.LittleEndian, &temp); err != nil {
+			return nil, err
+		}
+		for i, item := range temp {
+			indices[i] = uint32(item)
+		}
+	} else {
+		if _, err := binary.Decode(buffer.Data[idxBufferOffset:], binary.LittleEndian, &indices); err != nil {
+			return nil, err
+		}
+	}
+	return indices, nil
+}
+
+func ensurePadding(doc *gltf.Document) {
+	buffer := lastBuffer(doc)
+	padding := getPadding(uint32(len(buffer.Data)))
+	buffer.Data = append(buffer.Data, make([]byte, padding)...)
+	buffer.ByteLength += padding
+}
+
+func lastBuffer(doc *gltf.Document) *gltf.Buffer {
+	if len(doc.Buffers) == 0 {
+		doc.Buffers = append(doc.Buffers, new(gltf.Buffer))
+	}
+	return doc.Buffers[len(doc.Buffers)-1]
+}
+
+func getPadding(offset uint32) uint32 {
+	padAlign := offset % 4
+	if padAlign == 0 {
+		return 0
+	}
+	return 4 - padAlign
+}
+
+// This library uses uint32's for everything, so lets make sure the length of a buffer never exceeds uint32 max
+func ensureCapacity(doc *gltf.Document, buffer *gltf.Buffer, dataLen uint64) *gltf.Buffer {
+	if uint64(buffer.ByteLength)+dataLen > 0xffffffff {
+		doc.Buffers = append(doc.Buffers, new(gltf.Buffer))
+		buffer = lastBuffer(doc)
+	}
+	return buffer
+}
+
+func AddBoundingBox(doc *gltf.Document, name string, meshHeader unit.MeshHeader, info *unit.Info, meshNodes *[]uint32) {
+	transform := info.Bones[meshHeader.AABBTransformIndex].Matrix
+	AddBoundingBoxWithTransform(doc, name, meshHeader, info, meshNodes, transform)
+}
+
+func AddBoundingBoxWithTransform(doc *gltf.Document, name string, meshHeader unit.MeshHeader, info *unit.Info, meshNodes *[]uint32, transform mgl32.Mat4) {
+	var indices []uint32 = []uint32{
+		0, 1,
+		0, 5,
+		0, 3,
+		1, 4,
+		1, 2,
+		5, 4,
+		5, 6,
+		4, 7,
+		3, 2,
+		3, 6,
+		6, 7,
+		2, 7,
+	}
+
+	vMin := meshHeader.AABB.Min
+	vMax := meshHeader.AABB.Max
+
+	var vertices [][3]float32 = [][3]float32{
+		vMin,
+		{vMax[0], vMin[1], vMin[2]},
+		{vMax[0], vMin[1], vMax[2]},
+		{vMin[0], vMin[1], vMax[2]},
+		{vMax[0], vMax[1], vMin[2]},
+		{vMin[0], vMax[1], vMin[2]},
+		{vMin[0], vMax[1], vMax[2]},
+		vMax,
+	}
+
+	for i := range vertices {
+		vertices[i] = transform.Mul4x1(mgl32.Vec3(vertices[i]).Vec4(1.0)).Vec3()
+		vertices[i][1], vertices[i][2] = vertices[i][2], -vertices[i][1]
+	}
+
+	positions := modeler.WritePosition(doc, vertices)
+	index := gltf.Index(modeler.WriteIndices(doc, indices))
+
+	primitive := &gltf.Primitive{
+		Indices: index,
+		Attributes: map[string]uint32{
+			gltf.POSITION: positions,
+		},
+		Mode: gltf.PrimitiveLines,
+	}
+
+	doc.Meshes = append(doc.Meshes, &gltf.Mesh{
+		Name: name,
+		Primitives: []*gltf.Primitive{
+			primitive,
+		},
+	})
+	idx := uint32(len(doc.Nodes))
+	doc.Nodes = append(doc.Nodes, &gltf.Node{
+		Name: name,
+		Mesh: gltf.Index(uint32(len(doc.Meshes) - 1)),
+	})
+	*meshNodes = append(*meshNodes, idx)
+}
+
+func getExtras(doc *gltf.Document, geometryGroup stingray.Hash) map[string]any {
+	extras, ok := doc.Extras.(map[string]any)
+	if !ok {
+		return nil
+	}
+	if geometryGroup.Value == 0x0 {
+		return extras
+	}
+	geoExtrasIface, contains := extras[geometryGroup.String()+".geometry_group cache"]
+	if !contains {
+		return nil
+	}
+	geoExtras, ok := geoExtrasIface.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return geoExtras
+}
+
+func setExtras(doc *gltf.Document, geometryGroup stingray.Hash, extras map[string]any) {
+	if geometryGroup.Value == 0x0 {
+		doc.Extras = extras
+		return
+	}
+	baseExtras, ok := doc.Extras.(map[string]any)
+	if !ok {
+		baseExtras = make(map[string]any)
+	}
+	baseExtras[geometryGroup.String()+".geometry_group cache"] = extras
+}
+
+func LoadGLTF(ctx *extractor.Context, gpuR io.ReadSeeker, doc *gltf.Document, meshInfos []MeshInfo, bones []stingray.ThinHash, meshLayouts []unit.MeshLayout, unitInfo *unit.Info, meshNodes *[]uint32, materialIndices []MaterialVariantMap, parent uint32, skin *uint32) error {
+	cfg := ctx.Config()
+
+	unitName, contains := ctx.Hashes()[ctx.FileID().Name]
+	if !contains {
+		unitName = ctx.FileID().Name.String()
+	} else {
+		items := strings.Split(unitName, "/")
+		unitName = items[len(items)-1]
+	}
+
+	layoutToVertexBufferView := make(map[uint32]uint32)
+	layoutToIndexAccessor := make(map[uint32]*gltf.Accessor)
+	layoutAttributes := make(map[uint32]map[string]*gltf.Accessor)
+
+	if unitInfo.GeometryGroup.Value != 0x0 {
+		extras := getExtras(doc, unitInfo.GeometryGroup)
+		if extras != nil {
+			if vertexBufferViewIface, contains := extras["layoutToVertexBufferView"]; contains {
+				vertexBufferView, ok := vertexBufferViewIface.(map[uint32]uint32)
+				if ok {
+					layoutToVertexBufferView = vertexBufferView
+				}
+			}
+
+			if attributesIface, contains := extras["layoutAttributes"]; contains {
+				attributes, ok := attributesIface.(map[uint32]map[string]*gltf.Accessor)
+				if ok {
+					layoutAttributes = attributes
+				}
+			}
+
+			if indicesIface, contains := extras["layoutToIndexAccessor"]; contains {
+				indices, ok := indicesIface.(map[uint32]*gltf.Accessor)
+				if ok {
+					layoutToIndexAccessor = indices
+				}
+			}
+		}
+	}
+
+	var variants map[string]any
+	var variantsOk bool
+	variants, variantsOk = doc.Extensions["KHR_materials_variants"].(map[string]any)
+	if len(materialIndices) > 1 {
+		variantsArr := make([]map[string]string, 0)
+		if variantsOk {
+			existingVariantsArr, ok := variants["variants"].([]map[string]string)
+			if ok {
+				variantsArr = existingVariantsArr
+			}
+		}
+		// We've got skins besides "default", so lets make some variants
+		for _, materialVariant := range materialIndices {
+			variantsArr = append(variantsArr, map[string]string{
+				"name": materialVariant.Name,
+			})
+		}
+		if !slices.Contains(doc.ExtensionsUsed, "KHR_materials_variants") {
+			doc.ExtensionsUsed = append(doc.ExtensionsUsed, "KHR_materials_variants")
+		}
+		if doc.Extensions == nil {
+			doc.Extensions = make(gltf.Extensions)
+		}
+		doc.Extensions["KHR_materials_variants"] = map[string][]map[string]string{
+			"variants": variantsArr,
+		}
+	}
+
+	boneList := make([]int, 0)
+	gameMeshIdx := -1
+	for idx, bone := range unitInfo.Bones {
+		if len(bone.Children) == 0 {
+			continue
+		}
+		name := ctx.LookupThinHash(bone.NameHash)
+		if strings.Contains(name, "game") ||
+			strings.Contains(name, "cha_seaf_soldier_male") {
+			gameMeshIdx = idx
+		}
+		if strings.Contains(name, "game") ||
+			strings.Contains(name, "cha_seaf_soldier_male") ||
+			strings.Contains(name, "shadow") ||
+			strings.Contains(name, "rubble") {
+			boneList = append(boneList, idx)
+		}
+	}
+
+	children := make([]uint32, 0)
+	for {
+		if len(boneList) == 0 {
+			break
+		}
+		boneIdx := boneList[0]
+		boneList = boneList[1:]
+		if boneIdx != -1 {
+			children = append(children, unitInfo.Bones[boneIdx].Children...)
+			for _, child := range unitInfo.Bones[boneIdx].Children {
+				boneList = append(boneList, int(child))
+			}
+		}
+	}
+
+	gameMeshes := make(map[string][]string)
+	for _, child := range children {
+		boneName := ctx.LookupThinHash(unitInfo.Bones[child].NameHash)
+		if strings.Contains(boneName, "0x") {
+			continue
+		}
+		meshName := boneName
+		if strings.Contains(boneName, "_LOD") {
+			meshName = boneName[:len(boneName)-5]
+		}
+		meshName = strings.TrimSuffix(meshName, "_shadow")
+		if _, ok := gameMeshes[meshName]; !ok {
+			gameMeshes[meshName] = make([]string, 0)
+		}
+		gameMeshes[meshName] = append(gameMeshes[meshName], boneName)
+	}
+	for key := range gameMeshes {
+		slices.Sort(gameMeshes[key])
+	}
+
+	for i, header := range meshInfos {
+		if header.MeshLayoutIndex >= uint32(len(meshLayouts)) {
+			return fmt.Errorf("MeshLayoutIndex out of bounds")
+		}
+
+		groupNameBoneIdx := -1
+		for k, bone := range unitInfo.Bones {
+			if bone.NameHash == bones[i] {
+				groupNameBoneIdx = k
+				break
+			}
+		}
+
+		groupName := ctx.LookupThinHash(bones[i])
+		meshName := strings.TrimSuffix(groupName, "_LOD0")
+		var lodValue int = -1
+		for i := range 8 {
+			meshName = strings.TrimSuffix(meshName, fmt.Sprintf("_LOD%v", i+1))
+		}
+		if lodNames, ok := gameMeshes[meshName]; ok && !cfg.Model.IncludeLODS && lodNames[0] != groupName {
+			continue
+		} else if ok {
+			lodValue = slices.Index(lodNames, groupName)
+		}
+
+		var fbxConvertIdx, transformBoneIdxGeo int = -1, -1
+		var transformMatrix mgl32.Mat4 = mgl32.Ident4()
+		var err error
+		_, fbxConvertIdx, transformBoneIdxGeo = GetMeshNameFbxConvertAndTransformBone(unitInfo, bones[i])
+		vertexBuffer, contains := layoutToVertexBufferView[header.MeshLayoutIndex]
+		layout := meshLayouts[header.MeshLayoutIndex]
+		if !contains {
+			data, accessorInfo, err := ConvertVertices(gpuR, layout)
+			if err != nil {
+				return err
+			}
+			vertexBuffer, err = AddMeshLayoutVertexBuffer(doc, data, accessorInfo)
+			if err != nil {
+				return err
+			}
+			layoutToVertexBufferView[header.MeshLayoutIndex] = vertexBuffer
+			layoutAttributes[header.MeshLayoutIndex] = CreateAttributes(doc, layout, accessorInfo)
+
+			if unitInfo.GeometryGroup.Value != 0 {
+				extras := getExtras(doc, unitInfo.GeometryGroup)
+				if extras == nil {
+					extras = make(map[string]any)
+				}
+				extras["layoutToVertexBufferView"] = layoutToVertexBufferView
+				extras["layoutAttributes"] = layoutAttributes
+				setExtras(doc, unitInfo.GeometryGroup, extras)
+			}
+		}
+
+		indexAccessor, contains := layoutToIndexAccessor[header.MeshLayoutIndex]
+		if !contains {
+			indexAccessor, err = LoadMeshLayoutIndices(gpuR, doc, layout)
+			if err != nil {
+				return err
+			}
+			layoutToIndexAccessor[header.MeshLayoutIndex] = indexAccessor
+			if unitInfo.GeometryGroup.Value != 0 {
+				extras := getExtras(doc, unitInfo.GeometryGroup)
+				if extras == nil {
+					extras = make(map[string]any)
+				}
+				extras["layoutToIndexAccessor"] = layoutToIndexAccessor
+				setExtras(doc, unitInfo.GeometryGroup, extras)
+			}
+		}
+
+		visibilityMaskData, err := datalib.ParseVisibilityMasks()
+		if err != nil {
+			ctx.Warnf("ParseVisibilityMasks: %v", err)
+			visibilityMaskData = make(map[stingray.Hash]datalib.VisibilityMaskComponent)
+		}
+
+		udimPrimitives := make(map[uint32][]*gltf.Primitive)
+		nodeName := groupName
+		remapped := make(map[uint32]bool)
+		var transformedPositions, transformedNormals bool = false, false
+		var previousPositionAccessor, previousNormalAccessor *gltf.Accessor
+		var visibilityMasks map[uint16]map[string]any
+		for j, group := range header.Groups {
+			// Check if this group is a gib or collision mesh, if it is skip it unless include gibs or include lods is set
+			var materialName string
+			if int(group.MaterialIdx) < len(header.Materials) {
+				if _, contains := ctx.ThinHashes()[header.Materials[group.MaterialIdx]]; contains {
+					materialName = ctx.ThinHashes()[header.Materials[group.MaterialIdx]]
+				} else {
+					materialName = header.Materials[group.MaterialIdx].String()
+				}
+			} else {
+				ctx.Warnf("unknown material, %v >= %v", group.MaterialIdx, len(header.Materials))
+				materialName = "unknown"
+			}
+
+			if strings.Contains(materialName, "gibs") && !cfg.Model.IncludeGibs {
+				continue
+			}
+
+			if strings.Contains(materialName, "collis") && !cfg.Model.IncludeLODS {
+				continue
+			}
+
+			if strings.Contains(materialName, "shadow") && !cfg.Model.IncludeLODS {
+				continue
+			}
+
+			// Add geometry data accessors
+			doc.Accessors = append(doc.Accessors, &gltf.Accessor{
+				BufferView:    indexAccessor.BufferView,
+				ByteOffset:    group.IndexOffset * indexAccessor.ComponentType.ByteSize(),
+				ComponentType: indexAccessor.ComponentType,
+				Type:          gltf.AccessorScalar,
+				Count:         group.NumIndices,
+			})
+			groupIndices := gltf.Index(uint32(len(doc.Accessors)) - 1)
+
+			offset := doc.BufferViews[*indexAccessor.BufferView].ByteOffset + doc.Accessors[*groupIndices].ByteOffset
+			buffer := doc.Buffers[doc.BufferViews[*indexAccessor.BufferView].Buffer]
+			maxIndex, err := getMaxIndex(buffer, offset, group.NumIndices, indexAccessor.ComponentType)
+			if err != nil {
+				return err
+			}
+
+			groupAttr, err := AddGroupAttributes(doc, group, layoutAttributes[header.MeshLayoutIndex], vertexBuffer, maxIndex)
+			if err != nil {
+				return err
+			}
+
+			// Post process data:
+			//   * Reorient in gltf space and align position with group matrix
+			//   * Remap raw joints using skeleton maps
+			//   * Flip normals if reorientation changed winding order of vertices
+			//   * Separate UDIMs
+			var transformBoneIdxMesh int32 = -1
+			var meshHeader unit.MeshHeader
+			for _, meshInfo := range unitInfo.MeshInfos {
+				if meshInfo.Header.MeshName == bones[i] {
+					transformBoneIdxMesh = int32(meshInfo.Header.TransformIdx)
+					meshHeader = meshInfo.Header
+					break
+				}
+			}
+			if transformBoneIdxGeo != -1 {
+				transformMatrix = unitInfo.Bones[transformBoneIdxGeo].Matrix
+			}
+			// If translation, rotation, and scale are identities, use the TransformIndex instead
+			if transformMatrix.ApproxEqual(mgl32.Ident4()) && transformBoneIdxMesh != -1 {
+				transformMatrix = unitInfo.Bones[transformBoneIdxMesh].Matrix
+			}
+
+			if transformBoneIdxGeo == -1 && transformBoneIdxMesh == -1 && groupNameBoneIdx != -1 {
+				transformMatrix = unitInfo.Bones[groupNameBoneIdx].Matrix
+			}
+
+			// Transform coordinates into glTF ones
+			if fbxConvertIdx == -1 {
+				transformMatrix = stingray.ToGLTFMatrix.Mul4(transformMatrix)
+			}
+
+			if positionAccessor, contains := groupAttr[gltf.POSITION]; contains {
+				addPositionMinMax(doc, transformMatrix, mgl32.Vec3(meshHeader.AABB.Min), mgl32.Vec3(meshHeader.AABB.Max), positionAccessor)
+
+				var vertexOffset uint32 = 0
+				if previousPositionAccessor != nil && previousPositionAccessor.Count < doc.Accessors[positionAccessor].Count {
+					// Check if there are vertices that still need to be transformed
+					vertexOffset = previousPositionAccessor.Count
+				}
+				if !((transformedPositions && vertexOffset == 0) || transformMatrix.ApproxEqual(mgl32.Ident4())) {
+					// Only transform vertices once, and only perform the multiplications if the transform does something
+					bufferOffset := doc.Accessors[positionAccessor].ByteOffset + doc.BufferViews[vertexBuffer].ByteOffset
+					stride := doc.BufferViews[vertexBuffer].ByteStride
+					buffer := doc.Buffers[doc.BufferViews[vertexBuffer].Buffer]
+					err := TransformVertices(buffer, bufferOffset, stride, vertexOffset, doc.Accessors[positionAccessor].Count, transformMatrix)
+					if err != nil {
+						return err
+					}
+					transformedPositions = true
+				}
+				previousPositionAccessor = doc.Accessors[positionAccessor]
+			}
+
+			if normalAccessor, contains := groupAttr[gltf.NORMAL]; contains {
+				tangentAccessor, contains := groupAttr[gltf.TANGENT]
+				if !contains {
+					return fmt.Errorf("normal present but tangent not present")
+				}
+				var vertexOffset uint32 = 0
+				if previousNormalAccessor != nil && previousNormalAccessor.Count < doc.Accessors[normalAccessor].Count {
+					// Check if there are vertices that still need to be transformed
+					vertexOffset = previousNormalAccessor.Count
+				}
+				if !((transformedNormals && vertexOffset == 0) || transformMatrix.ApproxEqual(mgl32.Ident4())) {
+					// Only transform vertices once, and only perform the multiplications if the transform does something
+					bufferOffset := doc.Accessors[normalAccessor].ByteOffset + doc.BufferViews[vertexBuffer].ByteOffset
+					stride := doc.BufferViews[vertexBuffer].ByteStride
+					buffer := doc.Buffers[doc.BufferViews[vertexBuffer].Buffer]
+
+					// Strip translation and scaling (which hopefully leaves us with only rotation)
+					rotationMatrix := transformMatrix.Mat3().Mat4()
+					invScaleX := 1.0 / rotationMatrix.Col(0).Len()
+					invScaleY := 1.0 / rotationMatrix.Col(1).Len()
+					invScaleZ := 1.0 / rotationMatrix.Col(2).Len()
+					rotationMatrix = rotationMatrix.Mul4(mgl32.Scale3D(invScaleX, invScaleY, invScaleZ))
+
+					err := TransformVertices(buffer, bufferOffset, stride, vertexOffset, doc.Accessors[normalAccessor].Count, rotationMatrix)
+					if err != nil {
+						return err
+					}
+
+					bufferOffset = doc.Accessors[tangentAccessor].ByteOffset + doc.BufferViews[vertexBuffer].ByteOffset
+					err = TransformVertices(buffer, bufferOffset, stride, vertexOffset, doc.Accessors[tangentAccessor].Count, rotationMatrix)
+					if err != nil {
+						return err
+					}
+					transformedNormals = true
+				}
+				previousNormalAccessor = doc.Accessors[normalAccessor]
+			}
+
+			_, beenRemapped := remapped[*groupIndices]
+			if jointsAccessor, contains := groupAttr[gltf.JOINTS_0]; contains && !beenRemapped && len(unitInfo.SkeletonMaps) > int(meshHeader.SkeletonMapIdx) {
+				bufferOffset := doc.Accessors[jointsAccessor].ByteOffset + doc.BufferViews[vertexBuffer].ByteOffset
+				stride := doc.BufferViews[vertexBuffer].ByteStride
+				buffer := doc.Buffers[doc.BufferViews[vertexBuffer].Buffer]
+				skeletonMap := unitInfo.SkeletonMaps[meshHeader.SkeletonMapIdx]
+				if j >= len(skeletonMap.RemapList) {
+					return fmt.Errorf("%v out of range of components", j)
+				}
+				remapList := skeletonMap.RemapList[j]
+				idxAccessor := doc.Accessors[*groupIndices]
+				idxBufferView := doc.BufferViews[*doc.Accessors[*groupIndices].BufferView]
+				idxBuffer := doc.Buffers[idxBufferView.Buffer]
+				indices, err := getIndices(idxBuffer, idxBufferView, idxAccessor)
+				if err != nil {
+					return err
+				}
+				err = remapJoints(buffer, stride, bufferOffset, group.NumVertices, indices, doc.Accessors[jointsAccessor].ComponentType, remapList, skeletonMap.BoneIndices)
+				if err != nil {
+					return err
+				}
+				remapped[*groupIndices] = true
+			}
+
+			if transformMatrix.Det() < 0 {
+				// The transform flipped the winding order of our vertices, so we need to flip the index order to compensate
+				bufferOffset := indexAccessor.ByteOffset + doc.BufferViews[*indexAccessor.BufferView].ByteOffset
+				buffer := doc.Buffers[doc.BufferViews[*indexAccessor.BufferView].Buffer]
+				flipNormals(buffer, indexAccessor.ComponentType, group.NumIndices, bufferOffset)
+			}
+
+			entityHash := ctx.FileID().Name
+			if cfg.Unit.EntityName != "" {
+				newHash, err := stingray.ParseOrSum(cfg.Unit.EntityName)
+				if err == nil {
+					entityHash = newHash
+				}
+			}
+			mask, contains := visibilityMaskData[entityHash]
+			if !contains {
+				// Some model names do not match any of the names of the entities that include them
+				// so they need to be patched up to get the correct visibility masks
+				entityHash = datalib.UnitsToEntities(ctx.FileID().Name)
+				mask, contains = visibilityMaskData[entityHash]
+			}
+			visibilityMasks = make(map[uint16]map[string]any)
+			udimIndexAccessors := make(map[uint32]uint32)
+			visiblityMaskLength := mask.Length()
+			if !cfg.Model.JoinComponents && visiblityMaskLength > 0 {
+				texcoordIndex, ok := groupAttr[gltf.TEXCOORD_0]
+				// Don't separate udims of LODs or shadow meshes, unless this is LOD1 and we don't have an LOD0
+				if ok && lodValue == 0 {
+					texcoordAccessor := doc.Accessors[texcoordIndex]
+					groupIndexAccessor := doc.Accessors[*groupIndices]
+					var UDIMs map[uint32][]uint32
+					if UDIMs, err = separateUDims(doc, groupIndexAccessor, texcoordAccessor, materialName); err != nil {
+						ctx.Warnf("separateUDims: %v", err)
+					} else {
+						for udim, indices := range UDIMs {
+							udimIndexAccessors[udim] = modeler.WriteIndices(doc, indices)
+						}
+						for i := 0; contains && i < visiblityMaskLength; i++ {
+							visibilityMasks[mask.MaskInfos[i].Index] = map[string]any{
+								"name":           ctx.LookupThinHash(mask.MaskInfos[i].Name),
+								"index":          mask.MaskInfos[i].Index,
+								"default_hidden": mask.MaskInfos[i].StartHidden,
+							}
+						}
+					}
+				}
+			}
+			includeLOD := (cfg.Model.IncludeLODS && lodValue != 0 || strings.Contains(groupName, "0x") || gameMeshIdx == -1)
+			if (cfg.Model.JoinComponents || visiblityMaskLength == 0) && lodValue == 0 || includeLOD {
+				udimIndexAccessors[0] = *groupIndices
+			}
+
+			if cfg.Model.BoundingBoxes {
+				AddBoundingBox(doc, nodeName+" Bounding Box", meshHeader, unitInfo, meshNodes)
+			}
+
+			var material *uint32
+			// There are a couple of models where there are fewer materials than meshes, so this is here
+			// to prevent us from panicking if we're exporting one of those
+			if len(materialIndices) == 0 {
+				name := ctx.LookupThinHash(header.Materials[group.MaterialIdx])
+				material = extr_material.AddDummyMaterial(doc, name)
+				ctx.Warnf("Unit does not contain any materials")
+			} else if int(group.MaterialIdx) < len(header.Materials) {
+				materialVal, ok := materialIndices[0].MaterialHashToIndex[header.Materials[group.MaterialIdx]]
+				if ok {
+					material = &materialVal
+				}
+			}
+
+			var mappings []map[string]any = nil
+			if len(materialIndices) > 1 {
+				mappings = make([]map[string]any, 0)
+				// We've got skins besides "default", so lets make some variants
+				for idx, materialVariant := range materialIndices {
+					materialVal, ok := materialVariant.MaterialHashToIndex[header.Materials[group.MaterialIdx]]
+					if !ok {
+						continue
+					}
+					mappings = append(mappings, map[string]any{
+						"material": materialVal,
+						"variants": []uint32{
+							uint32(idx),
+						},
+					})
+				}
+			}
+
+			for udim, indexAccessor := range udimIndexAccessors {
+				udimPrimitives[udim] = append(udimPrimitives[udim], &gltf.Primitive{
+					Extras: map[string]stingray.ThinHash{
+						"slot": header.Materials[group.MaterialIdx],
+					},
+					Attributes: groupAttr,
+					Indices:    gltf.Index(indexAccessor),
+					Material:   material,
+				})
+				if mappings != nil {
+					udimPrimitives[udim][len(udimPrimitives[udim])-1].Extensions = map[string]any{
+						"KHR_materials_variants": map[string]any{
+							"mappings": mappings,
+						},
+					}
+				}
+			}
+		}
+		for udim, primitives := range udimPrimitives {
+			doc.Meshes = append(doc.Meshes, &gltf.Mesh{
+				Primitives: primitives,
+			})
+
+			udimNodeName := nodeName
+			if len(udimPrimitives) > 1 {
+				if _, contains := visibilityMasks[uint16(udim)]; !contains {
+					visibilityMasks[uint16(udim)] = map[string]any{
+						"name":           fmt.Sprintf("udim %v", udim),
+						"index":          uint16(udim),
+						"default_hidden": false,
+					}
+				}
+				udimNodeName = fmt.Sprintf("%v %v", nodeName, visibilityMasks[uint16(udim)]["name"])
+			}
+			doc.Nodes = append(doc.Nodes, &gltf.Node{
+				Name: udimNodeName,
+				Mesh: gltf.Index(uint32(len(doc.Meshes)) - 1),
+			})
+			node := uint32(len(doc.Nodes)) - 1
+			if _, contains := primitives[0].Attributes[gltf.JOINTS_0]; contains {
+				doc.Nodes[node].Skin = skin
+			}
+			if len(udimPrimitives) > 1 && len(visibilityMasks) > 0 {
+				extras, ok := doc.Nodes[node].Extras.(map[string]any)
+				if !ok {
+					extras = visibilityMasks[uint16(udim)]
+				} else {
+					maps.Copy(extras, visibilityMasks[uint16(udim)])
+				}
+				doc.Nodes[node].Extras = extras
+			}
+			doc.Nodes[parent].Children = append(doc.Nodes[parent].Children, node)
+			*meshNodes = append(*meshNodes, node)
+		}
+	}
+
+	return nil
+}

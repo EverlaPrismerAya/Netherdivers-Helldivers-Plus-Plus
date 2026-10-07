@@ -1,0 +1,20 @@
+{ "EquipmentWwiseIndex": [
+    "EquipmentWwiseIndex_Carryable_FuelBarrel",
+    "EquipmentWwiseIndex_Carryable_Briefcase",
+    "EquipmentWwiseIndex_Carryable_Blackbox",
+    "EquipmentWwiseIndex_Carryable_Flag",
+    "EquipmentWwiseIndex_None",
+    "EquipmentWwiseIndex_Primary_Assault",
+    "EquipmentWwiseIndex_Primary_Marksman",
+    "EquipmentWwiseIndex_Primary_SMG",
+    "EquipmentWwiseIndex_Primary_Energy",
+    "EquipmentWwiseIndex_Primary_Shotgun",
+    "EquipmentWwiseIndex_Sidearm_Pistol",
+    "EquipmentWwiseIndex_Support_GrenadeLauncher",
+    "EquipmentWwiseIndex_Support_Launcher_Hollow",
+    "EquipmentWwiseIndex_Support_Launcher_Solid",
+    "EquipmentWwiseIndex_Support_Machinegun",
+    "EquipmentWwiseIndex_Support_Sniper",
+    "EquipmentWwiseIndex_Support_Thrower",
+    "EquipmentWwiseIndex_Support_Thrower_Arc"
+]}

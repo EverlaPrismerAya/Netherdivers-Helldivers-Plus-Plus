@@ -1,0 +1,9 @@
+.idea/
+__pycache__/
+build/
+local_research/
+*.hd2snap
+*.hd2snap.partial
+*.pyc
+scripts/modbuilder_export_harness/bin/
+scripts/modbuilder_export_harness/obj/

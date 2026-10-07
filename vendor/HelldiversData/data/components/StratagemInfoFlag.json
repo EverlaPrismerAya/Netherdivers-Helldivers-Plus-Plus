@@ -1,0 +1,22 @@
+{ "StratagemInfoFlag" : {
+    "support_weapon" : { "type": "uint" },
+    "hellpod" : { "type": "uint" },
+    "explosive" : { "type": "uint" },
+    "backpack" : { "type": "uint" },
+    "orbital" : { "type": "uint" },
+    "vehicle" : { "type": "uint" },
+    "fire" : { "type": "uint" },
+    "aerial" : { "type": "uint" },
+    "turret" : { "type": "uint" },
+    "straight_beacon" : { "type": "uint" },
+    "gas" : { "type": "uint" },
+    "light_antitank" : { "type": "uint" },
+    "antitank" : { "type": "uint" },
+    "lightantipersonnel" : { "type": "uint" },
+    "antipersonnel" : { "type": "uint" },
+    "stationaryreload" : { "type": "uint" },
+    "expendable" : { "type": "uint" },
+    "heat" : { "type": "uint" },
+    "beam" : { "type": "uint" },
+    "charge" : { "type": "uint" }
+}}

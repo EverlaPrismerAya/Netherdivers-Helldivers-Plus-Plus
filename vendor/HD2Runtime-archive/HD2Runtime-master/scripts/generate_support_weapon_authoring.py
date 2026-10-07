@@ -1,0 +1,1071 @@
+"""Generate guarded support-weapon authoring metadata from retained snapshot evidence."""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import build_profile  # noqa: E402  central build identity (schemas/build_profile.json)
+from migration import overlay as migration_overlay  # noqa: E402  build-migration hook
+import reticle_fields
+import weapon_movement_fields
+import fire_mode_fields
+import weapon_mode_fields
+import presentation_fields
+import status_fields
+import equipment_fields
+import support_callin_linkage
+import live_evidence
+
+ROOT=Path(__file__).resolve().parents[1]
+CATALOG=ROOT/'schemas/support_weapon_authoring_catalog.json'
+FIELDS=ROOT/'schemas/player_weapon_fields.json'
+LEGACY=ROOT/'research/support-weapon-runtime-F5FEE03DCFDB.json'
+COVERAGE=ROOT/'research/support-weapon-coverage-F5FEE03DCFDB.json'
+BACKPACK_AMMO=ROOT/'research/backpack-ammo-F5FEE03DCFDB.json'
+# Projectile hosts (research/projectile-builder): support weapons whose every shot is their own ProjectileWeapon +0,
+# with the class and component identity research/attack-outputs saw.
+BUILDER=ROOT/'research/projectile-builder-F5FEE03DCFDB.json'
+ATTACK_OUTPUTS=ROOT/'research/attack-outputs-F5FEE03DCFDB.json'
+HOST_UNVERIFIED=('Replaces the projectile this support weapon fires (its ProjectileWeapon +0, copied into the weapon '
+    'when it is built). The same structural rule as player component hosts: no customization delta patches a projectile '
+    'member and no other selector exists. Not yet shown in game for a support weapon.')
+UNVERIFIED_REASONS={
+    'reload.duration':'Schema-labelled native reload duration; scraped reload times agree only approximately '
+        '(they include animation), and the gameplay effect of an edit is not yet confirmed.',
+    'windup.wind_up_seconds':'Schema-labelled native wind-up time without an exact scraped match.',
+    'windup.wind_down_seconds':'Schema-labelled native wind-down time; no scraped value corroborates it and the '
+        'gameplay effect of an edit is not yet confirmed.'}
+JSON_OUTPUT=ROOT/'sdk/SupportWeaponAuthoringCapabilities.json'
+LUA_OUTPUT=ROOT/'domains/support_weapon_authoring.lua'
+
+
+BACKING_TYPES={
+    'projectile':'ProjectileSettings',
+    'damage':'DamageInfo',
+    'explosion_damage':'DamageInfo',
+    'explosion':'ExplosionSettings',
+    'arc':'ArcSettings',
+    'beam':'BeamSettings',
+    'status':'StatusEffectSettings',
+}
+
+
+def digest(value,length=20):
+    encoded=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+    return hashlib.sha256(encoded).hexdigest()[:length]
+
+
+def slug(value):
+    return re.sub(r'[^a-z0-9]+','-',str(value).lower()).strip('-')or'root'
+
+
+def weapon_key(name):
+    return support_callin_linkage.support_weapon_key(name)
+
+
+def backing_identity(backing):
+    if backing['kind']=='component':
+        return ('component',backing['component'],backing['recordIndex'],backing['indexRow'])
+    semantic_type=BACKING_TYPES[backing['settings']]
+    return ('settings',semantic_type,backing['settingsType'],backing['group'],
+        backing['row'],backing['recordType'])
+
+
+def backing_object_key(backing):
+    semantic_type=(backing['component']if backing['kind']=='component'
+        else BACKING_TYPES[backing['settings']])
+    return 'support-object/v1/'+slug(semantic_type)+'/'+digest(backing_identity(backing))
+
+
+def canonical_public_field_id(qualified):
+    parts=qualified.split('.')
+    if parts[0]in('projectile','damage','arc','beam','status')and len(parts)>2:
+        return parts[0]+'.'+'.'.join(parts[2:])
+    if parts[0]=='explosion'and len(parts)>2:
+        return 'explosion.'+'.'.join(parts[2:])
+    if parts[0]=='attack'and len(parts)==3 and parts[2]=='projectile':
+        return 'attack.projectile'
+    return qualified
+
+
+def descriptor_instance_key(weapon_name,field,public_field_id=None):
+    public_field_id=public_field_id or canonical_public_field_id(field['semanticFieldId'])
+    target=field['target']
+    identity={'weapon':weapon_name,'path':target['path'],'attack':target.get('attack'),
+        'qualifiedField':field['semanticFieldId'],'field':public_field_id,
+        'object':backing_object_key(field['backing'])}
+    readable='/'.join((slug(weapon_name),slug(target['path']),
+        slug(target.get('attack')or'root'),slug(public_field_id)))
+    return 'support-field/v1/'+readable+'/'+digest(identity,16)
+
+
+def audit_instance_coverage(runtime,public):
+    expected=[descriptor_instance_key(name,field)
+        for name,weapon in runtime['weapons'].items()for field in weapon['fields']]
+    published=[field['instanceKey']for field in public['fieldInstances']]
+    assert len(expected)==len(set(expected)),'internal support field instance keys are not unique'
+    assert len(published)==len(set(published)),'published support field instance keys are not unique'
+    assert set(expected)==set(published),'published support field instance identity coverage diverged'
+    return {'internalInstances':len(expected),'publishedInstances':len(published),
+        'missingInstances':len(set(expected)-set(published)),
+        'unexpectedInstances':len(set(published)-set(expected)),
+        'identityCoverage':'exact'}
+
+
+def lua(value):
+    if isinstance(value,dict):
+        return '{'+','.join('['+lua(k)+']='+lua(v) for k,v in sorted(value.items()))+'}'
+    if isinstance(value,list):return '{'+','.join(lua(item) for item in value)+'}'
+    if isinstance(value,bool):return'true'if value else'false'
+    if value is None:return'nil'
+    if isinstance(value,(int,float)):return repr(value)
+    return json.dumps(str(value),ensure_ascii=False)
+
+
+def refresh_catalog(base_path,legacy_path=LEGACY,catalog_path=CATALOG):
+    base=json.loads(Path(base_path).read_text());legacy=json.loads(Path(legacy_path).read_text())
+    runtime={item['resourceHash']:item for item in base['runtimeCandidates']}
+    explosive={item['resourceHash']:item for item in base['supportGraph']['explosiveEntities']}
+    racks={item['resourceHash']:item for item in base['supportGraph']['hellpodRacks']}
+    weapons=[];candidates={}
+    for weapon in legacy['weapons']:
+        resources=weapon['resourceHashes'];attack_resource=weapon.get('attackOwnerResourceHash')
+        for resource in resources:
+            if resource in runtime:
+                item=runtime[resource]
+                candidates[resource]={'resourceHash':resource,'ownership':item['ownership'],
+                    'resolvedFields':{key:value['value'] for key,value in item['resolvedFields'].items()},
+                    'ammo':item.get('ammo'),'attacks':item.get('attacks') or [],
+                    'chargeCadence':item.get('chargeCadence'),
+                    'implementationFamilies':item.get('implementationFamilies') or []}
+        if attack_resource and attack_resource in explosive:
+            item=explosive[attack_resource]
+            candidates[attack_resource]={'resourceHash':attack_resource,'ownership':item['ownership'],
+                'resolvedFields':{},'ammo':None,'attacks':item['attacks'],'chargeCadence':None,
+                'implementationFamilies':['placed_explosive']}
+        root_chain=[]
+        for node in weapon.get('ownershipChain') or []:
+            clean={key:node.get(key) for key in ('kind','resourceHash','component','recordKind','id','package')
+                   if node.get(key)is not None}
+            root_chain.append(clean)
+        fire=weapon.get('fireRateDiagnostics') or []
+        weapons.append({'name':weapon['catalogIdentity'],'resolution':weapon['identityResolution'],
+            'confidence':weapon['confidence'],'resources':resources,
+            'canonicalResource':weapon.get('canonicalResourceHash'),
+            'attackResource':attack_resource or weapon.get('canonicalResourceHash'),
+            'ownershipChain':root_chain,'attackGraph':weapon['attackGraph'],
+            'unresolvedLinks':weapon.get('unresolvedLinks') or [],
+            'backpackDependent':weapon['backpackDependent'],
+            'linkedAmmoOwned':any(item.get('weaponLinkedAmmoComponentOwned')
+                for item in weapon.get('ammoFeedMagazine') or []),
+            'fireRateDiagnosticOnly':bool(fire and fire[0].get('diagnosticOnly')),
+            'sourceSection':weapon.get('sourceSection'),'weaponType':weapon.get('weaponType'),
+            'rootRack':next((rack for rack in base['supportGraph']['hellpodRacks']
+                if rack['resourceHash']==weapon.get('canonicalResourceHash')),None)})
+    value={'schemaVersion':1,'sourceSnapshot':build_profile.SNAPSHOT_NAME,
+        'gameFingerprints':base['gameFingerprints'],'safety':{'writes':0,'protectionChanges':0,
+            'fixtureFallback':'disabled','mode':'snapshot'},'candidates':candidates,'weapons':weapons}
+    Path(catalog_path).write_text(json.dumps(value,indent=2)+'\n',newline='\n')
+
+
+def build(catalog_path=CATALOG):
+    source=json.loads(Path(catalog_path).read_text())
+    fed_backpacks={item['supportWeapon']:item for item in json.loads(BACKPACK_AMMO.read_text())['backpackFedWeapons']}
+    coverage=json.loads(COVERAGE.read_text())
+    delivery={name:item for name,item in coverage['deliveryResolution'].items()if item['decision']=='RESOLVED'}
+    schema=json.loads(FIELDS.read_text());definitions={item['id']:item for item in schema['fields']}
+    candidates=source['candidates'];weapon_names={item['name'] for item in source['weapons']}
+    assert len(source['weapons'])==35 and len(weapon_names)==35
+    call_in_linkage=support_callin_linkage.build()
+    assert set(call_in_linkage['supportWeapons'])==weapon_names,'call-in linkage weapon coverage diverged'
+    consumers=defaultdict(set)
+    for weapon in source['weapons']:
+        for resource in weapon['resources']:
+            candidate=candidates.get(resource)
+            if not candidate:continue
+            for attack in candidate['attacks']:
+                for key,kind in (('projectileSettings','projectile'),('damageInfo','damage'),
+                        ('explosionSettings','explosion'),('arcSettings','arc'),
+                        ('beamSettings','beam'),('statusSettings','status')):
+                    record=attack.get(key)
+                    if record:consumers[(kind,record['settingsType'],record['group'],record['row'],
+                        record['recordType'])].add(weapon['name'])
+
+    def definition(field_id):
+        # Status slots share one definition per role: damage.status_type / damage.status_strength.
+        field_id=re.sub(r'\.status_\d+_type$','.status_type',field_id)
+        field_id=re.sub(r'\.status_\d+_strength$','.status_strength',field_id)
+        if re.match(r'^explosion\.[^.]+\.damage\.status_(type|strength)$',field_id):
+            field_id='damage.x.'+field_id.split('.')[-1]
+        parts=field_id.split('.')
+        if parts[0]in('projectile','damage','arc','beam','status')and len(parts)>2:
+            return definitions[parts[0]+'.'+'.'.join(parts[2:])]
+        if parts[0]=='explosion'and len(parts)>2:
+            return definitions['explosion.'+'.'.join(parts[2:])]
+        if parts[0]=='attack'and len(parts)==3 and parts[2]=='projectile':
+            return definitions['attack.projectile']
+        return definitions[field_id]
+
+    def component(candidate,name,offset,storage):
+        owner=candidate['ownership'][name]
+        return {'kind':'component','component':name,'offset':offset,'storage':storage,
+            'width':1 if storage=='u8'else 4,'recordIndex':owner['recordIndex'],
+            'indexRow':owner['indexRow'],'ownerCount':owner['ownerCount'],
+            'uniqueOwner':owner['uniqueOwner']}
+
+    def settings(kind,record,offset,storage,role,linkage,**extra):
+        result={'kind':'settings','settings':kind,'offset':offset,'storage':storage,'width':4,
+            'group':record['group'],'row':record['row'],'recordType':record['recordType'],
+            'settingsType':record['settingsType'],'branch':role,'linkage':linkage}
+        result.update(extra);return result
+
+    def make_field(field_id,current,backing,target,editable=True,reason=None,acknowledgement=None):
+        spec=definition(field_id);shared=[];affects=False
+        if backing['kind']=='component':affects=backing.get('ownerCount',1)>1
+        else:
+            key=(backing['settings'],backing['settingsType'],backing['group'],backing['row'],
+                backing['recordType']);shared=sorted(consumers[key]-{target['weapon']});affects=True
+        return {'semanticFieldId':field_id,'semanticTarget':spec.get('semantic_target',spec['id']),
+            'displayName':spec['display_name'],'type':spec['type'],'unit':spec.get('unit'),
+            'currentDefault':current,'editable':editable,'acceptedForWrites':editable,
+            'derivedReadOnly':spec.get('derived',False),'backing':backing,'target':target,
+            'writeScope':('shared_'+backing.get('settings','component') if affects else'weapon_local'),
+            'sharedWithWeapons':shared,'affectsMultipleWeapons':affects,
+            'dynamicConsumersPossible':backing['kind']=='settings','reason':reason,
+            'acknowledgement':acknowledgement,
+            'acknowledgementReason':UNVERIFIED_REASONS.get(spec['id'])if acknowledgement else None}
+
+    def damage_fields(fields,candidate,attack,target,role,linkage,extra=None,prefix='damage'):
+        record=attack['damageInfo'];values=attack['resolvedFields'];extra=extra or{}
+        for suffix,key,offset,storage in (
+            ('standard_damage','standard_damage',4,'i32'),('durable_damage','durable_damage',8,'i32'),
+            ('ap_direct','ap_direct',12,'u32'),('ap_slight','ap_slight',16,'u32'),
+            ('ap_large','ap_large',20,'u32'),('ap_extreme','ap_extreme',24,'u32'),
+            ('demolition','demolition',28,'u32'),('stagger','stagger',32,'u32'),
+            ('push_force','push_force',36,'u32')):
+            field_id=('explosion.'+role+'.damage.'+suffix if prefix=='explosion'
+                else prefix+'.'+role+'.'+suffix)
+            fields.append(make_field(field_id,values.get(key),
+                settings('explosion_damage'if prefix=='explosion'else'damage',record,
+                    offset,storage,role,linkage,**extra),target))
+        # Status slots (see scripts/status_fields.py): typed references for used slots plus the attachment slot.
+        for spec in status_fields.slot_specs(record['recordType']):
+            if spec['role']=='strength'and not spec['attach']:continue
+            field_id=('explosion.'+role+'.damage.'if prefix=='explosion'else prefix+'.'+role+'.')+spec['suffix']
+            backing=settings('explosion_damage'if prefix=='explosion'else'damage',record,spec['offset'],
+                spec['storage'],role,linkage,**extra)
+            backing.update(status_fields.backing_extra(spec))
+            slot_field=make_field(field_id,spec['current'],backing,target)
+            if spec['role']=='type':slot_field['type']='status_reference'
+            # Direct-hit projectile rows are live-proven (schemas/live_evidence.json); other rows stay gated.
+            slot_field.update(status_fields.type_extra(spec,status_fields.projectile_live_evidence()
+                if prefix=='damage' and linkage=='projectile_damage' else None))
+            fields.append(slot_field)
+
+    builder_hosts={item['weapon']:item for item in json.loads(BUILDER.read_text())['supportHosts']}
+    output_weapons={item['weapon']:item for item in json.loads(ATTACK_OUTPUTS.read_text())['weapons']
+        if item['kind']=='support_weapon'}
+
+    def projectile_host_field(weapon,candidate,target):
+        # The projectile reference of a support component host: written only where research proved the member is the
+        # projectile every shot fires, on the component record research saw, for the attack that fires it.
+        host=builder_hosts.get(weapon['name']);research=output_weapons.get(weapon['name'])
+        if not host or not host['componentHost']or not research:return None
+        owner=candidate['ownership'].get('ProjectileWeaponComponentData')
+        identity=research['componentIdentity']
+        assert research['resource']==candidate['resourceHash']and owner and all(
+            owner[key]==identity[key]for key in('recordIndex','indexRow','ownerCount','uniqueOwner')),\
+            weapon['name']+': projectile host identity diverged from research/attack-outputs'
+        fired=research['reference']['value']
+        attack=next((item for item in candidate['attacks']if item['kind']=='Projectile'
+            and(item.get('projectileSettings')or{}).get('recordType')==fired),None)
+        assert attack,weapon['name']+': no reviewed attack fires the host projectile'
+        role=attack['role']
+        field=make_field('attack.'+role+'.projectile',{'weapon':weapon['name'],'attack':role,'projectileType':fired},
+            component(candidate,'ProjectileWeaponComponentData',0,'u32'),dict(target,path='attack',attack=role),
+            acknowledgement='allow_unverified_effect')
+        field['acknowledgementReason']=HOST_UNVERIFIED
+        field['projectileSource']={'status':host['status'],'mechanism':host['mechanism'],
+            'member':'ProjectileWeapon +0','reason':host['reason']}
+        field['referenceKind']='projectile';field['compatibilityClass']=research['compatibilityClass']
+        field['referenceRole']=role;field['referenceSettings']=research['output']['settings']
+        field['residency']={'classification':'PACKAGE_AUTO_LOADED'if research['packageAutoLoad']else'PACKAGE_REQUIRED',
+            'package':research['package'],'preloadSupported':True,'liveTested':False,'observedWithoutLoader':None,
+            'evidence':"The support weapon's own loadout package; Runtime loads it before a swap from a weapon in "
+                'another package.','reason':None}
+        field['effect']={'activeSource':'ACTIVE_AT_INSTANTIATION','appliesWhen':'weapon_build','instantiationOnly':True,
+            'activeSourceProven':True,'gameplayEffectProven':False,'unverifiedEffect':True,
+            'reason':('A component member the game copies into the weapon when it builds it: a weapon called in after '
+                'the write fires the new projectile; one already built keeps its copy until it is rebuilt.')}
+        # Exact (host, donor output) pairs a live test proved (support_projectile_reference): liveProvenValues.
+        return live_evidence.promote_field(field,weapon['name'])
+
+    reticle_rows,reticle_research=reticle_fields.load()
+    movement_rows=weapon_movement_fields.load()
+    fire_mode_rows,_=fire_mode_fields.load()
+    weapon_mode_rows,_=weapon_mode_fields.load()
+    presentation_rows,presentation_research,trait_values,penetration_values=presentation_fields.load()
+    runtime_weapons={};public_weapons=[]
+    # A duplicate group is resolved only by research-proven call-in delivery plus an
+    # exact scraped fingerprint. The call-in rack becomes the identity root and the
+    # delivered root the owner, reusing the reviewed live chain re-proof.
+    resolved_source=[]
+
+    def delivered_branch(branch):
+        # Delivery settles which root owns the attacks; a branch is resolved only if its runtime match is exact.
+        match=branch.get('runtimeMatch')
+        if match and not match.get('mismatchedFields'):
+            return dict(branch,state='RESOLVED',resolvedBy='call_in_delivery',unresolvedReason=None)
+        return dict(branch,state='PARTIAL',resolvedBy='call_in_delivery',unresolvedReason=
+            branch.get('unresolvedReason')or'no runtime attack matched this catalog branch')
+
+    for weapon in source['weapons']:
+        item=delivery.get(weapon['name'])
+        if item:
+            rack=item['rack'];root=item['deliveredRoot'];call_in=item['callIn']
+            weapon=dict(weapon,resolution='DELIVERY_RESOLVED',canonicalResource=rack['resourceHash'],
+                attackResource=root,rootRack=rack,nonDeliveredRoots=sorted(set(weapon['resources'])-{root}),
+                ownershipChain=[{'kind':'stratagem_payload','resourceHash':rack['resourceHash'],
+                    'recordKind':call_in['recordKind'],'id':call_in['id'],'package':call_in['package']},
+                    {'kind':'delivery_rack','resourceHash':rack['resourceHash'],
+                        'component':'HellpodRackComponentData'},
+                    {'kind':'delivered_weapon','resourceHash':root}],
+                attackGraph=[delivered_branch(branch)if branch.get('state')=='IDENTITY_AMBIGUOUS'else branch
+                    for branch in weapon['attackGraph']])
+        resolved_source.append(weapon)
+    source=dict(source,weapons=resolved_source)
+    for weapon in source['weapons']:
+        unique=weapon['resolution']in('UNIQUE','DELIVERY_RESOLVED');block=None if unique else(
+            'Duplicate runtime roots remain after downstream graph audit; no root is selected heuristically.')
+        candidate=candidates.get(weapon['attackResource']) or(
+            candidates.get(weapon['canonicalResource']) if weapon['canonicalResource'] else None)
+        fields=[];attacks={};blocked=[]
+        resolved_roles={branch.get('runtimeMatch',{}).get('runtimeAttackRole')
+            for branch in weapon['attackGraph']if branch.get('state')=='RESOLVED'}
+        if not unique:
+            blocked.append({'field':'ordinary writes','reason':block})
+            if weapon['name']=='LAS-98 Laser Cannon':
+                blocked.extend((
+                    {'field':'heat.* / heatsink.*','reason':
+                        'WeaponHeatComponentData is present on the reviewed runtime candidates, but three duplicate weapon roots remain.'},
+                    {'field':'beam.* / damage.*','reason':
+                        'BeamSettings and linked DamageInfo are structurally proven, but their owning LAS-98 root remains ambiguous.'}))
+        if candidate and unique:
+            resolved=candidate['resolvedFields'];ownership=candidate['ownership']
+            target={'resource':'support_weapon','path':'weapon','weapon':weapon['name']}
+            for field_id,key,offset,storage in (
+                ('weapon.ergonomics','ergonomics',356,'f32'),('weapon.sway','sway',104,'f32'),
+                ('weapon.horizontal_spread','spread_horizontal',84,'f32'),
+                ('weapon.vertical_spread','spread_vertical',88,'f32'),
+                ('weapon.recoil_drift_horizontal','recoil_drift_horizontal',0,'f32'),
+                ('weapon.recoil_drift_vertical','recoil_drift_vertical',4,'f32'),
+                ('weapon.recoil_climb_horizontal','recoil_climb_horizontal',28,'f32'),
+                ('weapon.recoil_climb_vertical','recoil_climb_vertical',32,'f32')):
+                if key in resolved and'WeaponDataComponentData'in ownership:
+                    fields.append(make_field(field_id,resolved[key],
+                        component(candidate,'WeaponDataComponentData',offset,storage),target))
+            movement=movement_rows.get(('support',weapon['name']))
+            if movement and movement['weaponData'] and'WeaponDataComponentData'in ownership:
+                owner=weapon['attackResource']if weapon['resolution']=='DELIVERY_RESOLVED'else(
+                    weapon.get('attackResource')or weapon['canonicalResource'])
+                item=make_field(weapon_movement_fields.FIELD,None,component(candidate,'WeaponDataComponentData',
+                    weapon_movement_fields.OFFSET,weapon_movement_fields.STORAGE),target,
+                    acknowledgement='allow_unverified_effect')
+                fields.append(weapon_movement_fields.apply(item,movement,owner))
+            fire=fire_mode_rows.get(('support',weapon['name']))
+            if fire and fire['state']!='absent'and'WeaponDataComponentData'in ownership:
+                if fire_mode_fields.writable(fire):
+                    modes=fire_mode_fields.apply_modes(make_field(fire_mode_fields.MODES_FIELD,None,
+                        component(candidate,'WeaponDataComponentData',fire_mode_fields.MODES_OFFSET,'fire_mode_set'),
+                        target),fire,True)
+                    burst=fire_mode_fields.apply_burst(make_field(fire_mode_fields.BURST_FIELD,None,
+                        component(candidate,'WeaponDataComponentData',fire_mode_fields.BURST_OFFSET,'u32'),
+                        target),fire,True)
+                    for item in (modes,burst):
+                        item['acknowledgementReason']=fire_mode_fields.UNVERIFIED
+                        fields.append(item)
+                else:
+                    for field_id in (fire_mode_fields.MODES_FIELD,fire_mode_fields.BURST_FIELD):
+                        blocked.append({'field':field_id,'reason':fire['reason']})
+            # Rate-of-fire modes, weapon-function input bindings and the ProgrammableAmmo projectile
+            # (research/weapon-functions-F5FEE03DCFDB.json). Support fieldInstances are writable by contract: a field
+            # this weapon cannot author is a blocked declaration.
+            modes=weapon_mode_rows.get(('support',weapon['name']))or{}
+            mode_fields=[]
+            if weapon['fireRateDiagnosticOnly']and(modes.get('fireRate')or{}).get('state')not in(None,'absent'):
+                blocked.append({'field':weapon_mode_fields.RATES_FIELD,'reason':'Charge-controlled or diagnostic '
+                    'selector; its native rates are not exposed as ordinary RPM (as weapon.fire_rate).'})
+            if(modes.get('fireRate')or{}).get('state')not in(None,'absent')and'ProjectileWeaponComponentData'in ownership \
+                    and not weapon['fireRateDiagnosticOnly']:
+                mode_fields.append(weapon_mode_fields.apply_rates(make_field(weapon_mode_fields.RATES_FIELD,None,
+                    component(candidate,'ProjectileWeaponComponentData',weapon_mode_fields.RATES_OFFSET,'fire_rate_set'),
+                    target),modes,True))
+            if modes.get('inputs')and'WeaponDataComponentData'in ownership:
+                for side,field_id in weapon_mode_fields.INPUT_FIELDS.items():
+                    mode_fields.append(weapon_mode_fields.apply_input(make_field(field_id,None,
+                        component(candidate,'WeaponDataComponentData',weapon_mode_fields.INPUT_OFFSETS[side],'u32'),
+                        target),modes,side,True))
+            if(modes.get('functionAmmo')or{}).get('state')not in(None,'absent')\
+                    and'ProjectileWeaponComponentData'in ownership:
+                mode_fields.append(weapon_mode_fields.apply_function_projectile(make_field(
+                    weapon_mode_fields.FUNCTION_PROJECTILE_FIELD,None,component(candidate,'ProjectileWeaponComponentData',
+                        weapon_mode_fields.FUNCTION_PROJECTILE_OFFSET,'u32'),target),modes,True))
+            # Armory presentation: the delivered weapon's own LoadoutEntry trait tags.
+            presentation=presentation_rows.get(('support',weapon['name']))
+            presentation_backing=presentation and presentation['state']!='absent'and presentation_fields.backing(
+                presentation,candidate['resourceHash'],'trait_set')
+            if presentation_backing:
+                mode_fields.append(presentation_fields.apply_traits(make_field(presentation_fields.TRAITS_FIELD,None,
+                    presentation_backing,target),presentation,presentation_research,trait_values,True))
+                mode_fields.append(presentation_fields.apply_penetration(make_field(presentation_fields.PENETRATION_FIELD,
+                    None,dict(presentation_backing,storage='armor_penetration_label'),target),presentation,
+                    presentation_research,penetration_values,True))
+            for item in mode_fields:
+                if item['editable']:fields.append(item)
+                else:blocked.append({'field':item['semanticFieldId'],'reason':item['reason']})
+            reticle=reticle_rows.get(('support',weapon['name']))
+            if reticle and reticle['reticle']!='absent'and'WeaponDataComponentData'in ownership:
+                field=reticle_fields.apply(make_field(reticle_fields.FIELD,None,
+                    component(candidate,'WeaponDataComponentData',reticle_fields.OFFSET,reticle_fields.STORAGE),
+                    target),reticle,reticle_research,True)
+                # Support fieldInstances are writable by contract; a present but unmapped policy is a
+                # blocked declaration instead.
+                if field['editable']:fields.append(field)
+                else:blocked.append({'field':reticle_fields.FIELD,'reason':field['reason']})
+            if 'ProjectileWeaponComponentData'in ownership and not weapon['fireRateDiagnosticOnly']:
+                fields.append(make_field('weapon.fire_rate',resolved['fire_rate'],
+                    component(candidate,'ProjectileWeaponComponentData',8,'f32'),target))
+            elif weapon['fireRateDiagnosticOnly']:
+                blocked.append({'field':'weapon.fire_rate','reason':
+                    'Charge-controlled or diagnostic selector; native sentinel/default is not exposed as ordinary RPM.'})
+            ammo=candidate.get('ammo')or{};kind=ammo.get('kind')
+            if kind=='magazine'and'WeaponMagazineComponentData'in ownership:
+                for field_id,key,offset in (
+                    ('weapon.capacity','capacity_value',136),
+                    ('magazine.starting_magazines','starting_magazines',140),
+                    ('magazine.magazines_from_supply','magazines_from_supply',144),
+                    ('magazine.spare_magazines','spare_magazines',148)):
+                    fields.append(make_field(field_id,ammo.get(key),
+                        component(candidate,'WeaponMagazineComponentData',offset,'u32'),target))
+            elif kind=='rounds'and'WeaponRoundsComponentData'in ownership:
+                for field_id,key,offset,storage in (
+                    ('rounds.feed_capacity_1','feed_capacity_1',72,'f32'),
+                    ('rounds.feed_capacity_2','feed_capacity_2',76,'f32'),
+                    ('rounds.spare_rounds','spare_rounds',80,'u32'),
+                    ('rounds.rounds_from_supply','rounds_from_supply',84,'u32'),
+                    ('rounds.starting_rounds','starting_rounds',88,'u32')):
+                    fields.append(make_field(field_id,ammo.get(key),
+                        component(candidate,'WeaponRoundsComponentData',offset,storage),target))
+            extra=coverage['weapons'].get(weapon['name'])or{}
+            reload=extra.get('reload')
+            if reload and reload['resource']==weapon['attackResource']:
+                backing={'kind':'component','component':'WeaponReloadComponentData','offset':56,
+                    'storage':'f32','width':4,'recordIndex':reload['recordIndex'],'indexRow':reload['indexRow'],
+                    'ownerCount':reload['ownerCount'],'uniqueOwner':reload['uniqueOwner']}
+                if reload['writable']:
+                    fields.append(make_field('reload.duration',reload['duration'],backing,target,
+                        acknowledgement='allow_unverified_effect'))
+                else:blocked.append({'field':'reload.duration','reason':reload['reason']})
+            windup=extra.get('windUp')
+            if windup and windup['resource']==weapon['attackResource']:
+                backing={'kind':'component','component':'WeaponWindUpComponentData','storage':'f32',
+                    'width':4,'recordIndex':windup['recordIndex'],'indexRow':windup['indexRow'],
+                    'ownerCount':windup['ownerCount'],'uniqueOwner':windup['uniqueOwner']}
+                exact=windup['wikiSpinUp']is not None and abs(windup['wikiSpinUp']-windup['windUpSeconds'])<1e-6
+                fields.append(make_field('windup.wind_up_seconds',windup['windUpSeconds'],dict(backing,offset=0),
+                    target,acknowledgement=None if exact else'allow_unverified_effect'))
+                fields.append(make_field('windup.wind_down_seconds',windup['windDownSeconds'],
+                    dict(backing,offset=4),target,acknowledgement='allow_unverified_effect'))
+            charge=candidate.get('chargeCadence')
+            if charge and'WeaponChargeComponentData'in ownership:
+                for field_id,value,offset in (
+                    ('charge.level_1',charge['levels'][0],0),('charge.level_2',charge['levels'][1],24),
+                    ('charge.level_3',charge['levels'][2],48),
+                    ('charge.minimum_seconds',charge['minimumSeconds'],72),
+                    ('charge.maximum_seconds',charge['maximumSeconds'],76)):
+                    fields.append(make_field(field_id,value,
+                        component(candidate,'WeaponChargeComponentData',offset,'f32'),target))
+            if 'WeaponHeatComponentData'in ownership:
+                for field_id,key,offset,storage in (
+                    ('heat.capacity','heat_capacity',96,'f32'),('heat.heat_per_shot','heat_per_shot',116,'f32'),
+                    ('heat.heat_per_second','heat_per_second',120,'f32'),
+                    ('heat.cool_per_second','heat_cool_per_second',128,'f32'),
+                    ('heatsink.starting','heatsink_starting',84,'u32'),
+                    ('heatsink.from_supply','heatsink_from_supply',88,'u32'),
+                    ('heatsink.spare','heatsink_spare',92,'u32')):
+                    if key in resolved:fields.append(make_field(field_id,resolved[key],
+                        component(candidate,'WeaponHeatComponentData',offset,storage),target))
+            # research/equipment-coverage: the beam fire rate and the Maxigun recoil multipliers.
+            def equipment_make(field_id,value,backing):
+                return make_field(field_id,value,backing,target,acknowledgement='allow_unverified_effect')
+            if weapon['name'] in equipment_fields.BEAM_RATE_WEAPONS and 'BeamWeaponComponentData'in ownership:
+                beam_rate=equipment_fields.beam_rate_field(equipment_make,weapon['name'],
+                    lambda offset,storage:component(candidate,'BeamWeaponComponentData',offset,storage))
+                if beam_rate:fields.append(beam_rate)
+            if weapon['name'] in equipment_fields.RECOIL_MULTIPLIER_WEAPONS and'WeaponDataComponentData'in ownership:
+                fields+=equipment_fields.recoil_multiplier_fields(equipment_make,
+                    lambda offset,storage:component(candidate,'WeaponDataComponentData',offset,storage))
+
+            host_field=projectile_host_field(weapon,candidate,target)
+            if host_field:fields.append(host_field)
+            for attack in candidate['attacks']:
+                role=attack['role'];kind=attack['kind']
+                if role not in resolved_roles:continue
+                target_path={'Projectile':'projectile_reference','Explosion':'explosion'}.get(kind,'attack')
+                attack_target={'resource':'support_weapon','path':target_path,'weapon':weapon['name'],'attack':role}
+                attacks[role]={'role':role,'kind':kind,'parentRole':attack.get('parentRole'),
+                    'targetPath':target_path}
+                if kind=='Projectile':
+                    record=attack['projectileSettings'];values=attack['resolvedFields']
+                    for suffix,key,offset,storage in (
+                        ('velocity','projectile_velocity',32,'f32'),('mass','projectile_mass',36,'f32'),
+                        ('drag','drag',40,'f32'),('gravity','gravity',44,'f32'),
+                        ('pellet_count','pellet_count',28,'u32')):
+                        fields.append(make_field('projectile.'+role+'.'+suffix,values.get(key),
+                            settings('projectile',record,offset,storage,role,'projectile'),attack_target))
+                    row=coverage['projectileRows'].get(str(record['row']))if record['group']==0 else None
+                    if row and row['recordType']==record['recordType']:
+                        for suffix,key,offset in (('lifetime','lifetime',52),
+                                ('penetration_slowdown','penetrationSlowdown',64)):
+                            if suffix=='lifetime'and row[key]==0:
+                                # 0 is the no-explicit-lifetime state; a non-zero value would add a
+                                # limit rather than tune one, which is not proven.
+                                blocked.append({'attack':role,'field':'projectile.lifetime','reason':
+                                    'Native lifetime is 0 (no explicit limit); only non-zero lifetimes are tunable.'})
+                                continue
+                            fields.append(make_field('projectile.'+role+'.'+suffix,row[key],
+                                settings('projectile',record,offset,'f32',role,'projectile'),attack_target))
+                    else:
+                        blocked.extend({'attack':role,'field':name,
+                            'reason':'Projectile row outside the reviewed coverage set.'}
+                            for name in ('projectile.lifetime','projectile.penetration_slowdown'))
+                    damage_fields(fields,candidate,attack,attack_target,role,'projectile_damage')
+                elif kind in('Arc','Beam'):
+                    settings_name=kind.lower();record=attack[settings_name+'Settings']
+                    values=candidate['resolvedFields']if kind=='Beam'else attack['resolvedFields']
+                    layout=(
+                        (('velocity','arc_velocity',4,'f32'),('range','arc_range',8,'f32'),
+                         ('distance_at_max_spread','arc_spread',12,'f32'),
+                         ('max_angle_spread','arc_chain_spread',20,'f32'),
+                         ('chain_count','arc_chain_count',28,'u32'),('max_split','arc_max_split',32,'u32'))
+                        if kind=='Arc'else(('radius','beam_radius',4,'f32'),('length','beam_range',8,'f32')))
+                    for suffix,key,offset,storage in layout:
+                        fields.append(make_field(settings_name+'.'+role+'.'+suffix,values.get(key),
+                            settings(settings_name,record,offset,storage,role,settings_name),attack_target))
+                    damage_fields(fields,candidate,attack,attack_target,role,settings_name+'_damage')
+                elif kind in('Spray','Melee'):
+                    damage_fields(fields,candidate,attack,attack_target,role,kind.lower()+'_damage')
+                elif kind=='Explosion':
+                    standalone='ExplosiveComponentData'in ownership
+                    parent=attack.get('parentRole');phase='impact' if role.endswith('impact')else'detonation'
+                    linkage='explosive_explosion'if standalone else'projectile_explosion'
+                    extra={'selectorOffset':40 if role=='impact'and standalone else 36}if standalone else{
+                        'parentRole':parent,'phase':'expiry'if role.endswith('expiry')else'impact'}
+                    record=attack['explosionSettings'];values=attack['resolvedFields']
+                    for suffix,key,offset in (('inner_radius','explosion_inner_radius',16),
+                            ('outer_radius','explosion_outer_radius',20),
+                            ('shockwave_radius','explosion_shockwave_radius',24)):
+                        fields.append(make_field('explosion.'+role+'.'+suffix,values.get(key),
+                            settings('explosion',record,offset,'f32',role,linkage,**extra),attack_target))
+                    damage_fields(fields,candidate,attack,attack_target,role,linkage+'_damage',extra,
+                        prefix='explosion')
+                elif kind=='Status':
+                    parent=next((item for item in candidate['attacks'] if item['role']==attack.get('parentRole')),None)
+                    if parent and parent.get('damageInfo'):
+                        effects=parent.get('statusEffects')or[]
+                        index=next((i for i,item in enumerate(effects)if item['type']==attack['statusType']),None)
+                        status_extra={'parentRole':parent['role']}
+                        if parent['kind']=='Explosion':
+                            standalone='ExplosiveComponentData'in ownership
+                            parent_linkage='explosive_explosion_damage'if standalone else'projectile_explosion_damage'
+                            if standalone:status_extra['selectorOffset']=40 if parent['role']=='impact'else 36
+                            else:
+                                status_extra['parentRole']=parent.get('parentRole')
+                                status_extra['phase']='expiry'if parent['role'].endswith('expiry')else'impact'
+                        else:parent_linkage=parent['kind'].lower()+'_damage'
+                        if index is not None:
+                            fields.append(make_field('status.'+role+'.strength',
+                                attack['resolvedFields']['status_strength'],settings('damage',parent['damageInfo'],
+                                48+index*8,'f32',role,parent_linkage,**status_extra),attack_target))
+                    fields.append(make_field('status.'+role+'.duration',attack['resolvedFields']['status_duration'],
+                        settings('status',attack['statusSettings'],40,'f32',role,'status',
+                            statusType=attack['statusType'],
+                            parentLinkage=parent_linkage if parent and parent.get('damageInfo')else None,
+                            **(status_extra if parent and parent.get('damageInfo')else{})),attack_target))
+        fed=fed_backpacks.get(weapon['name'])
+        if fed:
+            blocked.append({'field':'weapon magazine','reason':
+                'The weapon owns no WeaponMagazineComponent. Its ammunition is the backpack DepositComponent: '
+                'author it through hd2.support_weapon(name):backpack().'})
+        else:
+            if weapon['backpackDependent']:
+                blocked.append({'field':'backpack storage','reason':
+                    'Backpack entity/package storage ownership is unresolved; weapon-side fields remain independent.'})
+            if weapon['linkedAmmoOwned']:
+                blocked.append({'field':'linked backpack ammo','reason':
+                    'WeaponLinkedAmmo ownership is classified, but storage semantics are not proven.'})
+        if weapon['ownershipChain']and any(x['kind']=='stratagem_payload'for x in weapon['ownershipChain']):
+            blocked.append({'field':'linked stratagem scalars','reason':
+                'Cooldown and uses are owned by the linked stratagem view (linkedStratagem.semanticId); '
+                'call-in scalar ownership through the support weapon is not reviewed.'})
+        for reason in weapon['unresolvedLinks']:
+            if fed and reason.startswith('backpack entity/package ownership link'):continue
+            blocked.append({'field':'unresolved branch','reason':reason})
+
+        runtime_weapons[weapon['name']]={'name':weapon['name'],'resolution':weapon['resolution'],
+            'supportWeapon':True,
+            'ordinaryWritesBlocked':not unique,'blockReason':block,'resources':weapon['resources'],
+            'identityResource':weapon['canonicalResource'],'attackResource':weapon['attackResource'],
+            'ownershipChain':weapon['ownershipChain'],'rootRack':weapon.get('rootRack'),
+            'nonDeliveredRoots':weapon.get('nonDeliveredRoots'),
+            'fields':fields,'attacks':attacks}
+        categorized=defaultdict(list)
+        for field in fields:
+            generic=definition(field['semanticFieldId'])['id'];categorized[generic.split('.')[0]].append(generic)
+        for key in categorized:categorized[key]=sorted(set(categorized[key]))
+        public_branches=[]
+        for branch in weapon['attackGraph']:
+            runtime_role=(branch.get('runtimeMatch')or{}).get('runtimeAttackRole')
+            public_branches.append({'name':branch['name'],'kind':branch['kind'],
+                'parentAttack':branch.get('parentAttack'),'runtimeRole':runtime_role,
+                'state':branch['state'],'writable':unique and branch['state']=='RESOLVED'
+                    and runtime_role in attacks,
+                'blockedReason':block if not unique else branch.get('unresolvedReason')})
+        resolution_basis=None
+        if weapon['resolution']=='DELIVERY_RESOLVED':
+            confirmations=delivery[weapon['name']].get('confirmations')or['WIKI_MAGAZINE']
+            evidence={'WIKI_MAGAZINE':'That root alone has the scraped magazine values; the other roots differ.',
+                'LOADOUT_PACKAGE':"The call-in's own package is exactly that root's loadout package.",
+                'SUPPORT_WEAPON_PATH':('That root is the only candidate whose hash-verified resource path lies under '
+                    'the carried support-weapon equipment tree.')}
+            resolution_basis={'basis':('call_in_delivery_and_scraped_fingerprint'if'WIKI_MAGAZINE'in confirmations
+                    else'call_in_delivery_and_structural_identity'),
+                'confirmations':confirmations,
+                'evidence':['The linked call-in hellpod rack attaches exactly one candidate root.']
+                    +[evidence[item]for item in confirmations],
+                'nonDeliveredNativeRoots':len(weapon['nonDeliveredRoots']),
+                'nonDeliveredRootsAffected':False,
+                'note':('Fields edit only the call-in-delivered weapon. Other native roots with this catalog name '
+                    '(for example vehicle or emplacement variants) keep their own records; shared settings rows '
+                    'still require allow_shared.'),
+                'evidenceArtifact':COVERAGE.name}
+        public_weapons.append({'name':weapon['name'],'semanticId':weapon_key(weapon['name']),
+            'identityStatus':weapon['resolution'],'identityResolution':resolution_basis,
+            'confidence':weapon['confidence'],'family':sorted(set(
+                branch['kind'] for branch in weapon['attackGraph'] if branch['kind']!='Unknown')),
+            'attackBranches':public_branches,
+            'writableFieldsByDomain':dict(sorted(categorized.items())),
+            'sharedScopes':sorted(set(f['writeScope']for f in fields if f['affectsMultipleWeapons'])),
+            'blockedFields':blocked,'backpackDependency':weapon['backpackDependent'],
+            'linkedAmmoOwnership':weapon['linkedAmmoOwned'],
+            'ammoBackpack':None if not fed else {'backpack':weapon['name']+' Backpack',
+                'semanticId':'backpack/v1/'+re.sub(r'[^a-z0-9]+','-',(weapon['name']+' Backpack').lower()).strip('-')
+                    +'/'+hashlib.sha256(json.dumps(weapon['name']+' Backpack',sort_keys=True,separators=(',',':'))
+                    .encode()).hexdigest()[:16],
+                'accessor':'hd2.support_weapon(name):backpack()','owner':'backpack DepositComponent',
+                'weaponOwnsMagazine':False,'fields':['deposit.capacity','deposit.start_amount','deposit.refill_amount'],
+                'baseline':{'capacity':fed['deposit']['values']['0'],'startAmount':fed['deposit']['values']['4'],
+                    'refillAmount':fed['deposit']['values']['8']},
+                'catalog':'sdk/BackpackAuthoringCapabilities.json'},
+            'linkedStratagem':call_in_linkage['supportWeapons'][weapon['name']],
+            'writable':unique and bool(fields),'writableFieldCount':len(fields)if unique else 0})
+
+    # Build the canonical public instance/object model only after every internal
+    # descriptor exists. Raw native record coordinates are used solely to join
+    # evidence here; public keys are opaque semantic digests and expose none of
+    # those coordinates.
+    source_weapons={weapon['name']:weapon for weapon in source['weapons']}
+    public_weapon_by_name={weapon['name']:weapon for weapon in public_weapons}
+    reviewed_consumers=defaultdict(dict)
+
+    def branch_aliases(weapon_name,role):
+        weapon=source_weapons[weapon_name]
+        return [{'name':branch['name'],'kind':branch['kind'],'state':branch['state']}
+            for branch in weapon['attackGraph']
+            if (branch.get('runtimeMatch')or{}).get('runtimeAttackRole')==role]
+
+    def semantic_consumer(weapon_name,path,role=None,kind=None,parent_role=None):
+        aliases=branch_aliases(weapon_name,role)if role else[]
+        value={'weapon':weapon_name,'targetPath':path,'attackRole':role,
+            'attackKind':kind,'parentAttackRole':parent_role,
+            'catalogBranches':aliases,
+            'writableCatalogBranches':[branch for branch in aliases if branch['state']=='RESOLVED']}
+        value['consumerKey']='support-consumer/v1/'+slug(weapon_name)+'/'+slug(path)+'/'+slug(role or'root')+'/'+digest(value,16)
+        return value
+
+    def register_consumer(backing,consumer):
+        reviewed_consumers[backing_object_key(backing)][consumer['consumerKey']]=consumer
+
+    def record_backing(settings_name,record):
+        return {'kind':'settings','settings':settings_name,'settingsType':record['settingsType'],
+            'group':record['group'],'row':record['row'],'recordType':record['recordType']}
+
+    for weapon in source['weapons']:
+        resources=list(weapon['resources'])
+        if weapon.get('attackResource')and weapon['attackResource']not in resources:
+            resources.append(weapon['attackResource'])
+        for resource in resources:
+            candidate=candidates.get(resource)
+            if not candidate:continue
+            for component_name,owner in candidate['ownership'].items():
+                register_consumer({'kind':'component','component':component_name,
+                    'recordIndex':owner['recordIndex'],'indexRow':owner['indexRow']},
+                    semantic_consumer(weapon['name'],'weapon'))
+            for attack in candidate['attacks']:
+                role=attack['role'];kind=attack['kind'];parent=attack.get('parentRole')
+                if attack.get('projectileSettings'):
+                    register_consumer(record_backing('projectile',attack['projectileSettings']),
+                        semantic_consumer(weapon['name'],'projectile_reference',role,kind,parent))
+                if attack.get('damageInfo'):
+                    path=('projectile_reference'if kind=='Projectile'else
+                        'explosion'if kind=='Explosion'else'attack')
+                    register_consumer(record_backing('damage',attack['damageInfo']),
+                        semantic_consumer(weapon['name'],path,role,kind,parent))
+                for record_name,settings_name,path in (
+                        ('explosionSettings','explosion','explosion'),
+                        ('arcSettings','arc','attack'),('beamSettings','beam','attack'),
+                        ('statusSettings','status','attack')):
+                    record=attack.get(record_name)
+                    if record:register_consumer(record_backing(settings_name,record),
+                        semantic_consumer(weapon['name'],path,role,kind,parent))
+
+    for weapon_name,weapon in runtime_weapons.items():
+        for field in weapon['fields']:
+            target=field['target'];role=target.get('attack');attack=weapon['attacks'].get(role)or{}
+            register_consumer(field['backing'],semantic_consumer(weapon_name,target['path'],role,
+                attack.get('kind'),attack.get('parentRole')))
+
+    sdk_schema=json.loads((ROOT/'schemas/sdk.json').read_text())
+    api_constants=defaultdict(dict)
+    for resource in sdk_schema['resources'].values():
+        for name,field in resource['fields'].items():
+            api_constants[field['domain']][name.replace('.','_')]=name
+    for field_id in sorted(definitions):
+        domain,name=field_id.split('.',1);constant=name.replace('.','_')
+        if constant in api_constants[domain]and api_constants[domain][constant]!=field_id:
+            constant='player_'+constant
+        api_constants[domain][constant]=field_id
+
+    def api_constant(field_id):
+        domain=field_id.split('.',1)[0]
+        constant=next((name for name,value in api_constants[domain].items()if value==field_id),None)
+        # Slot-qualified status IDs have no schema definition of their own; scripts/generate_sdk.py publishes
+        # them under the plain name.
+        return 'hd2.fields.'+domain+'.'+(constant or field_id.split('.',1)[1].replace('.','_'))
+
+    object_fields=defaultdict(list)
+    for weapon_name,weapon in runtime_weapons.items():
+        for field in weapon['fields']:
+            object_fields[backing_object_key(field['backing'])].append((weapon_name,field))
+
+    backing_objects={}
+    for object_key,entries in object_fields.items():
+        backing=entries[0][1]['backing'];consumers=sorted(
+            reviewed_consumers[object_key].values(),key=lambda item:item['consumerKey'])
+        requires_shared=any(field['affectsMultipleWeapons']for _,field in entries)
+        scope_key='support-scope/v1/'+digest({'object':object_key,
+            'consumers':[item['consumerKey']for item in consumers]},20)
+        semantic_type=(backing['component']if backing['kind']=='component'
+            else BACKING_TYPES[backing['settings']])
+        backing_objects[object_key]={'objectKey':object_key,'kind':backing['kind'],
+            'semanticType':semantic_type,
+            'domains':sorted(set(definition(field['semanticFieldId'])['id'].split('.')[0]
+                for _,field in entries)),
+            'shared':requires_shared,'requiresSharedAcknowledgement':requires_shared,
+            'sharedScopeKey':scope_key,'reviewedConsumerCount':len(consumers),
+            'affectedSemanticConsumers':consumers,'reviewedScopeComplete':True,
+            'dynamicConsumersPossible':any(field['dynamicConsumersPossible']for _,field in entries),
+            'fieldInstanceKeys':[]}
+
+    def find_parent_object(weapon_name,field):
+        backing=field['backing'];linkage=backing.get('linkage')or''
+        fields=runtime_weapons[weapon_name]['fields'];target=field['target']
+        wanted=None;role=target.get('attack')
+        if backing.get('settings')=='status':
+            for candidate in fields:
+                if candidate['target']==target and candidate['backing'].get('settings')in(
+                        'damage','explosion_damage'):
+                    return backing_object_key(candidate['backing'])
+            return None
+        if linkage in('projectile_damage','projectile_explosion'):
+            wanted='projectile'
+            role=backing.get('parentRole')or role
+        elif linkage in('arc_damage','beam_damage'):
+            wanted=linkage.split('_',1)[0]
+            role=backing.get('parentRole')or role
+        elif linkage.endswith('explosion_damage'):
+            wanted='explosion'
+        if not wanted:return None
+        for candidate in fields:
+            candidate_backing=candidate['backing']
+            if candidate_backing.get('settings')==wanted and candidate['target'].get('attack')==role:
+                return backing_object_key(candidate_backing)
+        return None
+
+    def resolution_metadata(weapon_name,field):
+        backing=field['backing'];linkage=backing.get('linkage')
+        source_weapon=source_weapons[weapon_name]
+        root_chain=[node['kind']for node in source_weapon.get('ownershipChain')or[]]
+        parent=find_parent_object(weapon_name,field)
+        return {'rootChain':root_chain or['weapon_entity'],
+            'linkage':linkage or'owned_component','parentObjectKey':parent,
+            'terminalPhase':backing.get('phase'),
+            'planPhase':1,'planDependencies':[],
+            'requiresLaterPlanPhase':False,'targetFrom':None}
+
+    instances=[];operation_groups=defaultdict(list)
+    # Exact (weapon, field) pairs a live test promoted (schemas/live_evidence.json provenTargets).
+    live_targets=live_evidence.proven_targets()
+    for weapon_name,weapon in runtime_weapons.items():
+        public_weapon=public_weapon_by_name[weapon_name];public_weapon['fieldInstanceKeys']=[]
+        for field in weapon['fields']:
+            field_id=definition(field['semanticFieldId'])['id'];target=field['target']
+            if field['backing'].get('statusSlot'):
+                # Status slots publish their slot-qualified ID (damage.status_2_type), like player weapons.
+                field_id=canonical_public_field_id(field['semanticFieldId'])
+            role=target.get('attack');attack=weapon['attacks'].get(role)or{}
+            object_key=backing_object_key(field['backing']);object_meta=backing_objects[object_key]
+            instance_key=descriptor_instance_key(weapon_name,field,field_id)
+            backing_scope=(field['backing']['kind']+':'
+                +(field['backing'].get('settings')or field['backing'].get('component')))
+            target_identity={'weapon':weapon_name,'targetPath':target['path'],'attackRole':role}
+            operation_key='support-operation/v1/'+digest({'object':object_key,
+                'scope':backing_scope,'target':target_identity},20)
+            if field.get('operationGroup'):
+                # Fields written together across records (a selector binding and what it selects) share one group.
+                operation_key='support-operation/v1/'+digest({'group':field['operationGroup'],
+                    'target':target_identity},20)
+            plan_key='support-plan/v1/'+slug(weapon_name)+'/'+digest(weapon_name,12)
+            consumers=object_meta['affectedSemanticConsumers']
+            reference=None
+            if field['type'].endswith('_reference'):
+                reference={'expectedSemanticReference':field['currentDefault'],
+                    'sourceClass':field['type'],'typedIdentityOnly':True}
+            accessor=['support_weapon']
+            if target['path']!='weapon':
+                accessor.append('attack')
+                if target['path']=='projectile_reference':accessor.append('projectile')
+                elif target['path']=='explosion':accessor.append('explosion')
+            instance={'instanceKey':instance_key,'supportWeapon':weapon_name,
+                'supportWeaponIdentity':{'weaponKey':weapon_key(weapon_name),
+                    'name':weapon_name,'identityStatus':public_weapon['identityStatus']},
+                'target':{'resource':'support_weapon','path':target['path'],
+                    'attackRole':role,'attackKind':attack.get('kind'),
+                    'parentAttackRole':attack.get('parentRole'),
+                    'accessor':accessor,
+                    'catalogBranches':branch_aliases(weapon_name,role)if role else[],
+                    'writableCatalogBranches':[branch for branch in branch_aliases(weapon_name,role)
+                        if branch['state']=='RESOLVED']if role else[]},
+                'semanticFieldId':field_id,
+                'qualifiedSemanticFieldId':field['semanticFieldId'],
+                'apiFieldConstant':api_constant(field_id),
+                'display':{'name':field['displayName'],'domain':field_id.split('.')[0],
+                    'group':object_meta['semanticType']},
+                'value':{'kind':'reference'if reference else'scalar','type':field['type'],
+                    'baseline':field['currentDefault'],'expected':field['currentDefault'],
+                    'unit':field['unit'],'reference':reference},
+                'writable':field['acceptedForWrites'],'readOnly':not field['acceptedForWrites'],
+                'blockedReason':field['reason'],
+                'backing':{'objectKey':object_key,'kind':object_meta['kind'],
+                    'semanticType':object_meta['semanticType'],
+                    'domain':field['backing'].get('settings')or field['backing'].get('component'),
+                    'operationGroupingKey':operation_key,'runtimeBackingScope':backing_scope},
+                'sharedScope':{'scopeKey':object_meta['sharedScopeKey'],
+                    'shared':object_meta['shared'],
+                    'requiresAcknowledgement':object_meta['requiresSharedAcknowledgement'],
+                    'reviewedConsumerCount':object_meta['reviewedConsumerCount'],
+                    'affectedSemanticConsumers':consumers,
+                    'reviewedScopeComplete':object_meta['reviewedScopeComplete'],
+                    'dynamicConsumersPossible':object_meta['dynamicConsumersPossible']},
+                'operation':{'minimumApi':'hd2.patch','patchSupported':True,
+                    'transactionSupported':True,'transactionRequired':False,
+                    'transactionGroupingKey':operation_key,'planSupported':True,
+                    'planRequired':False,'planRequiredForMultipleBackingObjects':True,
+                    'planGroupingKey':plan_key,'phase':1,'dependencies':[],
+                    'allowSharedRequired':object_meta['requiresSharedAcknowledgement'],
+                    'acknowledgement':field.get('acknowledgement'),
+                    'acknowledgementReason':field.get('acknowledgementReason')},
+                **({'liveEvidence':field['liveEvidence']}if field.get('liveEvidence')else
+                    {'liveEvidence':live_targets[(weapon_name,field['semanticFieldId'])]}
+                    if(weapon_name,field['semanticFieldId'])in live_targets else{}),
+                'resolution':resolution_metadata(weapon_name,field),
+                'provenance':{'identity':'unique reviewed support-weapon runtime identity',
+                    'semantics':'shared player/support field schema',
+                    'ownership':'typed retained-snapshot ownership chain',
+                    'baseline':'exact retained-snapshot value',
+                    'validation':'production resolver guarded ALREADY_DESIRED no-op',
+                    'evidenceArtifact':'support-weapon-authoring-validation-F5FEE03DCFDB.json'}}
+            if field_id==fire_mode_fields.MODES_FIELD:
+                instance['fireMode']={key:field.get(key) for key in ('fireModeState','nativeSlots','allowedModes',
+                    'modeValues','maxModes','selector','evidence')}
+            # Public views carry semantic values only (no native IDs or code addresses; see the research files).
+            if field_id==weapon_mode_fields.RATES_FIELD:
+                instance['fireRate']={key:field.get(key) for key in ('fireRateState','nativeSlots','slotNames',
+                    'defaultSlot','selectorOrder','maxModes','selectorBound','selectorInput','bindableInputs','min','max',
+                    'overriddenWhenEquipped')}
+            if field_id in weapon_mode_fields.INPUT_FIELDS.values():
+                instance['weaponFunction']={key:field.get(key) for key in ('input','allowedValues')}
+            if field['type']=='projectile_reference':
+                # The host's projectile reference: semantic handles only (weapon:attack(role):projectile() as the
+                # expect; a donor from hd2.attack_output(name) or another weapon's attack projectile).
+                instance['projectileReference']={key:field.get(key)for key in('referenceKind','compatibilityClass',
+                    'referenceRole','projectileSource','residency','effect')}
+                instance['value']['baseline']=instance['value']['expected']={'weapon':weapon_name,'attack':role}
+                instance['value']['reference']['expectedSemanticReference']=(
+                    'hd2.support_weapon(name):attack("'+role+'"):projectile()')
+            if field_id==weapon_mode_fields.FUNCTION_PROJECTILE_FIELD:
+                instance['functionAmmo']={key:field.get(key) for key in ('functionAmmoState','selectorBound',
+                    'selectorInput','bindableInputs','compatibilityClass')}
+                native=field['currentDefault']['projectileType']!=0
+                instance['value']['baseline']=instance['value']['expected']='native'if native else'none'
+                instance['value']['reference']['expectedSemanticReference']=(
+                    'weapon:feed("programmable"):projectile()'if native else'none')
+            if field_id in(presentation_fields.TRAITS_FIELD,presentation_fields.PENETRATION_FIELD):
+                instance['presentation']={key:field.get(key) for key in ('labels','allowedValues','maxTraits',
+                    'armorPenetrationState')if key in field}
+            if field.get('effect'):
+                instance['effect']=field['effect']
+            if field_id==reticle_fields.FIELD:
+                instance['reticle']={key:field.get(key) for key in
+                    ('reticleState','nativeValue','nativeName','encoding','evidence')}
+            instances.append(instance);operation_groups[operation_key].append(instance_key)
+            object_meta['fieldInstanceKeys'].append(instance_key)
+            public_weapon['fieldInstanceKeys'].append(instance_key)
+
+    operation_group_entries=[]
+    instance_by_key={instance['instanceKey']:instance for instance in instances}
+    for operation_key,instance_keys in sorted(operation_groups.items()):
+        first=instance_by_key[instance_keys[0]]
+        operation_group_entries.append({'operationGroupingKey':operation_key,
+            'backingObjectKey':first['backing']['objectKey'],
+            'runtimeBackingScope':first['backing']['runtimeBackingScope'],
+            'target':first['target'],'fieldInstanceKeys':instance_keys,
+            'recommendedApi':'hd2.transaction'if len(instance_keys)>1 else'hd2.patch',
+            'allowSharedRequired':first['operation']['allowSharedRequired'],
+            'planGroupingKey':first['operation']['planGroupingKey'],'phase':1,
+            'dependencies':[]})
+
+    duplicate_groups=[];by_semantic=defaultdict(list)
+    for instance in instances:
+        by_semantic[(instance['supportWeapon'],instance['semanticFieldId'])].append(instance)
+    for (weapon_name,field_id),entries in sorted(by_semantic.items()):
+        if len(entries)>1:
+            duplicate_groups.append({'supportWeapon':weapon_name,'semanticFieldId':field_id,
+                'count':len(entries),'instanceKeys':[entry['instanceKey']for entry in entries],
+                'attackRoles':[entry['target']['attackRole']for entry in entries],
+                'backingObjectKeys':[entry['backing']['objectKey']for entry in entries]})
+
+    domain_counts=defaultdict(int);weapons_by_domain=defaultdict(int)
+    for weapon in public_weapons:
+        for domain,field_ids in weapon['writableFieldsByDomain'].items():
+            domain_counts[domain]+=sum(1 for field in runtime_weapons[weapon['name']]['fields']
+                if field['semanticFieldId'].split('.')[0]==domain)
+            if field_ids:weapons_by_domain[domain]+=1
+    summary={'catalogWeapons':35,'uniqueSupportIdentities':sum(w['resolution']=='UNIQUE'for w in source['weapons']),
+        'deliveryResolvedIdentities':sum(w['resolution']=='DELIVERY_RESOLVED'for w in source['weapons']),
+        'deliveryResolvedNames':[w['name']for w in source['weapons']if w['resolution']=='DELIVERY_RESOLVED'],
+        'duplicateGroupsBlocked':sum(w['resolution']=='DUPLICATE'for w in source['weapons']),
+        'duplicateGroupNames':[w['name']for w in source['weapons']if w['resolution']=='DUPLICATE'],
+        'writableSupportWeapons':sum(w['writable']for w in public_weapons),
+        'writableFieldInstances':sum(w['writableFieldCount']for w in public_weapons),
+        'fieldInstancesByDomain':dict(sorted(domain_counts.items())),
+        'weaponsWithDomain':dict(sorted(weapons_by_domain.items())),
+        'writableProjectileBranches':len({(w['name'],a['runtimeRole'])for w in public_weapons
+            for a in w['attackBranches']if a['kind']=='Projectile'and a['writable']}),
+        'writableExplosionBranches':len({(w['name'],a['runtimeRole'])for w in public_weapons
+            for a in w['attackBranches']if a['kind']=='Explosion'and a['writable']}),
+        'writableBranchesByFamily':{kind:len({(w['name'],a['runtimeRole'])
+            for w in public_weapons for a in w['attackBranches']
+            if a['kind']==kind and a['writable']})
+            for kind in ('Projectile','Explosion','Arc','Beam','Spray','Melee','Status')},
+        'weaponsWithHeatFields':weapons_by_domain['heat'],
+        'weaponsWithChargeFields':weapons_by_domain['charge'],
+        'weaponsWithDirectAmmoFields':sum(any(domain in w['writableFieldsByDomain']
+            for domain in ('magazine','rounds'))for w in public_weapons),
+        'linkedStratagemIdentities':sum(w['linkedStratagem']['known']for w in public_weapons),
+        'linkedStratagemScalarValues':0,
+        'supportCallInLinkage':call_in_linkage['audit'],
+        'sharedFieldInstances':sum(field['affectsMultipleWeapons']
+            for weapon in runtime_weapons.values()for field in weapon['fields']),
+        'internalSupportAuthoringInstances':sum(len(weapon['fields'])for weapon in runtime_weapons.values()),
+        'publishedSupportFieldInstances':len(instances),
+        'legacyFlattenedFieldEntries':sum(sum(len(fields)for fields in weapon['writableFieldsByDomain'].values())
+            for weapon in public_weapons),
+        'branchSpecificFieldInstances':sum(instance['target']['attackRole']is not None
+            for instance in instances),
+        'backingObjectCount':len(backing_objects),
+        'operationGroupingCount':len(operation_group_entries),
+        'sharedBackingObjectCount':sum(value['shared']for value in backing_objects.values()),
+        'sharedConsumerScopeCount':len({value['sharedScopeKey']for value in backing_objects.values()
+            if value['shared']}),
+        'duplicateSemanticFieldGroups':len(duplicate_groups),
+        'duplicateSemanticFieldInstances':sum(group['count']for group in duplicate_groups),
+        'deduplicationLossPrevented':len(instances)-sum(sum(len(fields)
+            for fields in weapon['writableFieldsByDomain'].values())for weapon in public_weapons),
+        'referenceFieldInstances':sum(instance['value']['kind']=='reference'for instance in instances),
+        'readOnlyFieldInstances':sum(instance['readOnly']for instance in instances),
+        'blockedFieldDeclarations':sum(len(weapon['blockedFields'])for weapon in public_weapons),
+        'intentionallyOmittedInstances':0,
+        'safety':source['safety']}
+    constants={}
+    for definition_item in schema['fields']:
+        domain,_,name=definition_item['id'].partition('.')
+        if domain in('charge','status'):constants.setdefault(domain,{})[name.replace('.','_')]=definition_item['id']
+    runtime={'version':(ROOT/'VERSION').read_text().strip(),'weapons':runtime_weapons,
+        'fields':constants,'summary':summary}
+    public={'schemaVersion':2,'contract':'hd2runtime.support_weapon.guarded_authoring.v2',
+        'hd2RuntimeVersion':runtime['version'],'summary':summary,'weapons':public_weapons,
+        'fieldInstances':instances,
+        'backingObjects':[backing_objects[key]for key in sorted(backing_objects)],
+        'operationGroups':operation_group_entries,
+        'duplicateSemanticFieldInstances':duplicate_groups,
+        'compatibility':{'legacyWeaponViewsRetained':True,
+            'legacyView':'weapons[].writableFieldsByDomain',
+            'legacyViewSemantics':'Deduplicated lookup only; use fieldInstances for authoring.',
+            'canonicalAuthoringCollection':'fieldInstances'},
+        'planContract':{'api':'hd2.plan','currentPhase':1,
+            'currentInstancesRequireTargetFrom':False,
+            'oneOperationPerOperationGroupingKey':True,
+            'multipleBackingObjectsRequirePlan':True},
+        'referenceContract':{'typedIdentityOnly':True,
+            'expectedValueProperty':'value.reference.expectedSemanticReference',
+            'sourceClassProperty':'value.reference.sourceClass',
+            'rawNativeIdentifiersPublished':False,
+            'currentReferenceFieldInstances':summary['referenceFieldInstances']},
+        'supportCallInLinks':{key:call_in_linkage[key]for key in
+            ('contract','schemaVersion','joinContract','relationships','audit')},
+        'safety':{'runtimeAddresses':False,'rawResourceIdentifiers':False,
+            'writesDuringGeneration':0,'protectionChangesDuringGeneration':0,'fixtureFallback':'disabled'}}
+    public['instanceAudit']=audit_instance_coverage(runtime,public)
+    return runtime,public
+
+
+def outputs(catalog_path=CATALOG):
+    runtime,public=build(catalog_path)
+    return {LUA_OUTPUT:'-- Generated guarded support-weapon authoring contract; do not edit.\nreturn '+lua(migration_overlay.apply('support_weapon_authoring', runtime))+'\n',
+        JSON_OUTPUT:json.dumps(public,indent=2)+'\n'}
+
+
+def generate(check=False,catalog_path=CATALOG):
+    stale=[]
+    for path,body in outputs(catalog_path).items():
+        if not path.exists()or path.read_text()!=body:
+            stale.append(path)
+            if not check:path.parent.mkdir(parents=True,exist_ok=True);path.write_text(body,newline='\n')
+    if check and stale:raise RuntimeError('Stale support authoring outputs: '+', '.join(map(str,stale)))
+    return stale
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--refresh-catalog',type=Path)
+    parser.add_argument('--check',action='store_true')
+    args=parser.parse_args()
+    if args.refresh_catalog:refresh_catalog(args.refresh_catalog)
+    print(', '.join(str(path.relative_to(ROOT))for path in generate(args.check))or'up to date')

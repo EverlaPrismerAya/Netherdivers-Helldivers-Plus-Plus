@@ -1,0 +1,47 @@
+{
+  "catalogWeapons": 35,
+  "resolvedIdentities": 35,
+  "uniqueIdentities": 27,
+  "duplicateIdentityGroups": 8,
+  "ambiguousIdentities": 0,
+  "unresolvedIdentities": 0,
+  "identityStatusCounts": {
+    "EXACT": 26,
+    "STRONG": 1,
+    "AMBIGUOUS": 8,
+    "UNMATCHED": 0
+  },
+  "sourceGroupCounts": {
+    "Civilian": 2,
+    "Engineering Bay": 4,
+    "Patriotic Administration Center": 13,
+    "Warbonds": 16
+  },
+  "catalogBranchCounts": {
+    "Projectile": 32,
+    "Explosion": 34,
+    "Beam": 2,
+    "Arc": 2,
+    "Spray": 3,
+    "Melee": 4,
+    "Status": 17,
+    "Unknown": 1
+  },
+  "resolvedBranchCounts": {
+    "Projectile": 17,
+    "Explosion": 18,
+    "Beam": 1,
+    "Arc": 1,
+    "Spray": 2,
+    "Melee": 2,
+    "Status": 8,
+    "Unknown": 0
+  },
+  "sharedSettingsGroups": 5,
+  "backpackDependentWeapons": 9,
+  "backpackWeaponsWithWeaponLinkedAmmoOwnership": 3,
+  "backpackEntityLinksProven": 0,
+  "readOnlySemanticResolutionReady": 27,
+  "guardedAuthoringReady": false,
+  "unresolvedWeapons": []
+}

@@ -1,0 +1,20 @@
+{ "MenuFontStyle": [
+    "MenuFontStyle_Title",
+    "MenuFontStyle_TitleMedium",
+    "MenuFontStyle_TitleMediumDescription",
+    "MenuFontStyle_HeaderBig",
+    "MenuFontStyle_HeaderMedium",
+    "MenuFontStyle_HeaderSmall",
+    "MenuFontStyle_BodyBig",
+    "MenuFontStyle_BodyMedium",
+    "MenuFontStyle_BodySmall",
+    "MenuFontStyle_HeaderBigRuntime",
+    "MenuFontStyle_BodyBigRuntime",
+    "MenuFontStyle_HeaderMediumRuntime",
+    "MenuFontStyle_BodyMediumRuntime",
+    "MenuFontStyle_HeaderSmallRuntime",
+    "MenuFontStyle_BodySmallRuntime",
+    "MenuFontStyle_TitleRuntime",
+    "MenuFontStyle_TitleMediumRuntime",
+    "MenuFontStyle_Count"
+]}

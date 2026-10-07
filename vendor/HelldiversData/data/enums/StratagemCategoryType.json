@@ -1,0 +1,9 @@
+{ "StratagemCategoryType": [
+    "StratagemCategoryType_CloseAirSupport",
+    "StratagemCategoryType_OrbitalFireSupport",
+    "StratagemCategoryType_HellpodDeployment",
+    "StratagemCategoryType_TactialAirInsertion",
+    "StratagemCategoryType_Special",
+    "StratagemCategoryType_OrbitalBombardment",
+    "StratagemCategoryType_Count"
+]}

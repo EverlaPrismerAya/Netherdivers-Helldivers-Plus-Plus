@@ -1,0 +1,7 @@
+{ "HelldiverCustomizationPassiveBonusSettings" : {
+    "passive_bonus" : { "type": "HelldiverCustomizationPassiveBonus", "default": "HelldiverCustomizationPassiveBonus_None" },
+    "name_loc" : { "type": "uint" },
+    "icon" : { "type": "ulong" },
+    "modifiers" : { "type": "array", "subtype": "HelldiverCustomizationPassiveBonusModifier" },
+    "stat_modifiers" : { "type": "array", "subtype": "HelldiverCustomizationStatModifier" }
+}}

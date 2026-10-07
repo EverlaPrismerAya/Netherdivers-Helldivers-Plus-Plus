@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/*
+logs/*
+fixtures/*.dump
+fixtures/*.bin
+_baseline/*
+tools/go/sdk/
+tools/go/*.zip
+tools/go/*.tar.gz
+vendor/*/.cache/
+vendor/*/node_modules/
+sample/*

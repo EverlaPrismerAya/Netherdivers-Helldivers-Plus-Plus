@@ -1,0 +1,138 @@
+{
+  "enemies": {
+    "attackFields": 1125,
+    "classes": 177,
+    "fields": 9106,
+    "readOnly": 1319,
+    "rejections": {
+      "acknowledgement": 1,
+      "attackAcknowledgement": 1,
+      "attackShared": 1,
+      "brokenMountChain": 1,
+      "range": 1,
+      "sentinel": 1,
+      "staleExpect": 1,
+      "structureAcknowledgement": 1
+    },
+    "roundTrips": {
+      "bile_bombard_explosion_damage": {
+        "field": "damage.standard_damage",
+        "from": 200,
+        "to": 20
+      },
+      "bile_bombard_velocity": {
+        "field": "projectile.velocity",
+        "from": 30,
+        "to": 15
+      },
+      "charger_head_armor": {
+        "field": "zone.armor",
+        "from": 4,
+        "to": 1
+      },
+      "charger_health": {
+        "field": "entity.health",
+        "from": 2400,
+        "to": 240
+      },
+      "fabricator_health": {
+        "field": "entity.health",
+        "from": 1500,
+        "to": 150
+      },
+      "gunship_rocket_blast_radius": {
+        "field": "explosion.outer_radius",
+        "from": 1.649999976158142,
+        "to": 3.299999952316284
+      },
+      "gunship_rocket_damage": {
+        "field": "damage.standard_damage",
+        "from": 30,
+        "to": 3
+      },
+      "warrior_head_health": {
+        "field": "zone.health",
+        "from": 110,
+        "to": 1
+      }
+    }
+  },
+  "fixtureFallback": "disabled",
+  "minefield": {
+    "liveProvenWithoutAcknowledgement": "minefield.salvos",
+    "rejections": {
+      "acknowledgement": 1,
+      "increase": 2
+    },
+    "roundTrips": {
+      "MD-17 Anti-Tank Mines": {
+        "field": "minefield.mines_per_salvo",
+        "from": 3,
+        "to": 1
+      },
+      "MD-6 Anti-Personnel Minefield": {
+        "field": "minefield.salvos",
+        "from": 6,
+        "to": 2
+      }
+    }
+  },
+  "mode": "snapshot-overlay",
+  "playerProjectileMembers": {
+    "fields": 75,
+    "roundTrip": {
+      "field": "projectile.penetration_slowdown",
+      "from": 0.25,
+      "to": 0.5,
+      "weapon": "AR-23 Liberator"
+    },
+    "weapons": 64
+  },
+  "protectionChanges": 24,
+  "snapshot": "F5FEE03DCFDB-20260926T222226Z.hd2snap",
+  "status": "VALIDATED",
+  "statusSlots": {
+    "attached": {
+      "liberator_fire": {
+        "after": "0500000000000040",
+        "before": "0000000000000000",
+        "slot": 1,
+        "status": "fire",
+        "strength": 2,
+        "weapon": "AR-23 Liberator",
+        "writes": 2
+      },
+      "maxigun_stun": {
+        "after": "2600000000000040",
+        "before": "0000000000000000",
+        "slot": 1,
+        "status": "stun_medium",
+        "strength": 2,
+        "weapon": "M-1000 Maxigun",
+        "writes": 2
+      }
+    },
+    "cleared": {
+      "flamethrower": {
+        "from": "fire_panic",
+        "slot": 3
+      }
+    },
+    "liveProvenWithoutAcknowledgement": 2,
+    "rejections": {
+      "acknowledgement": 1,
+      "middleSlotClear": 1,
+      "notAttachable": 1,
+      "packingHole": 1,
+      "staleCatalog": 1
+    },
+    "swapped": {
+      "coyote": {
+        "from": "fire",
+        "to": "stun_small",
+        "writes": 1
+      }
+    }
+  },
+  "writes": 34
+}

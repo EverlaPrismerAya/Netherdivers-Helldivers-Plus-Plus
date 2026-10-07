@@ -1,0 +1,101 @@
+# Runtime cost and steady state
+
+HD2Runtime separates one-time resolution from steady-state upkeep. After an ensured
+mod reaches its desired state, the only recurring work is a byte check of its
+applied targets, and that check backs off over time.
+
+| Work | When it runs |
+| --- | --- |
+| Build fingerprint (SHA-256 of the exe and game.dll, ~30 MB) | Once per process and loaded-module identity; shared by all mods |
+| Address-space discovery walk | Once per guarded operation. A completed walk is reused, after full re-validation, by operations starting within 15 s |
+| Entity catalog, ownership and linkage chains, stratagem table, settings parse | Once per guarded operation |
+| Guarded transaction (context rereads, page protection, write, verify) | Only when an operation runs: startup, or after drift |
+| Steady-state check | Every `interval` (default 60 s), doubling to `max_interval` (default 600 s): a few `VirtualQuery` calls and reads of the target bytes only |
+
+## Fingerprint cache
+
+The cache is an in-memory table of verified keys, one short string per
+successful match: run mode plus the base address and handle of the exe and of
+game.dll. No file contents, digests of other files, snapshot data, or disk cache
+are kept. Hashing streams each module file through one 1 MiB buffer, which is
+freed after the hash, and does not hold the ~30 MB of file data. Mismatches are
+never cached. Windows keeps a loaded module's image file locked, so a key stays
+valid for the life of the process.
+
+## Module loading
+
+The engine resolves archived Lua resources only while its startup package is
+loaded; later, `require` of a module that was never loaded fails with "module
+not found". At startup the packaged entry captures the loader of every shipped
+module into `package.preload`, without running it, so modules first needed at
+apply time or on drift still load. `scripts/validate_packaged_runtime.py` runs
+the built ZIP with late lookups disabled and fails the release if any module is
+required after startup and not captured.
+
+## `hd2.ensure`
+
+The first run is the complete guarded operation. After that, ensure keeps only the
+applied byte ranges, their owner allocation identity, and a 32-byte owner header.
+It then checks those at a backed-off interval, without discovery, catalog
+rebuilds, fingerprint hashing, protection changes, or writes. A missing or
+changed allocation, a changed header, or a target that is no longer desired
+counts as drift. Drift resets the interval and reruns the unchanged full guarded
+path. That path reapplies the edit, or rejects on conflict exactly as before.
+
+## Operation gate
+
+Only one guarded operation (patch, transaction, or plan) may be between its first
+read and its final write at a time; the others report `queued`. Before this,
+several mods starting together could invalidate each other's captured tables and
+fail closed. Time spent queued does not count against the resolution budget.
+
+## Metrics
+
+`hd2.metrics()` returns process-wide counters and worst durations, including:
+
+- `fingerprint.*`, `discover.walks` / `discover.regions` / `discover.shared_reuses`
+- `entity_catalog.captures`, `stratagem.table_captures`
+- `reader.queries` / `reader.bytes`
+- `transaction.applies` / `writes` / `already_desired_fields` / `protection_changes` / `guard_bytes`
+- `steady.verifications` / `drift`, `ensure.full_resolutions`
+- `exclusive.*`, `scheduler.ticks`, `log.lines`
+
+`worst_seconds['scheduler.tick']` is the longest single update-hook tick.
+
+## Audit
+
+`scripts/audit_steady_state.py` runs the example mods on the retained snapshot
+through a copy-on-write overlay that simulates writes. It covers startup, a
+steady-state window, a simulated game reinitialization, and all mods together,
+and records the results in `validation/steady-state-audit.json`. The same audit
+against the pre-fix 0.23.0 commit is kept in
+`validation/steady-state-audit-before-0.23.0-22ec478.json`.
+
+## Bounded retry
+
+`hd2.patch`, `hd2.transaction`, and `hd2.plan` share one policy (`runtime/retry.lua`). `observe`
+uses the same constants.
+
+- **Attempt:** one complete guarded resolution and application run that has actually started, after
+  the startup delay and after acquiring the operation gate. Time spent queued or waiting for a retry
+  never counts, and the resolution budget applies per attempt.
+- **Delay:** a fixed 5 update seconds between attempts, at most 6 attempts in total. After the last
+  attempt the operation is terminal and no further polling occurs.
+- **Retried failures:**
+  - `TARGET_UNAVAILABLE`: game modules not loaded yet, the entity region or a settings allocation
+    absent, or the stratagem table not initialized or not committed.
+  - `TARGET_UNSTABLE`: captured data changed while resolving. The stability reread raises this
+    before any write.
+
+  A plan failure retries only if its rollback verified or was not needed.
+- **Immediate failures:**
+  - value conflicts (`CONFLICT`);
+  - build fingerprint mismatch;
+  - identity, ownership, schema, or extent changes;
+  - transaction-core rejections, unverified rollback, or unrestored protection;
+  - resolution budget exhaustion.
+- **Success:** ends the operation immediately. A retry never re-applies a value that already verified.
+- **After retries run out:** the result reports `code` (`TARGET_UNAVAILABLE` or `TARGET_UNSTABLE`)
+  and `attempts`.
+- **Ensure:** when drift is detected, ensure starts a fresh guarded operation with its own 6 attempts.
+  While that operation retries, ensure stays alive. If it runs out of retries, ensure stops.

@@ -1,0 +1,16 @@
+.venv
+__pycache__
+/scripts_dist
+/extracted
+/fd_crossrefs.txt
+/all_files.txt
+cpu.prof
+filediver-gui-windows.exe
+filediver-gui.exe
+/filediver-gui
+filediver-cli.exe
+/filediver-cli
+/rsrc_windows_*.syso
+/bundles.dsaa
+/xamls-dumps
+/xamls

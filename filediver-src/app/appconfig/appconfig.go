@@ -1,0 +1,218 @@
+package appconfig
+
+import (
+	"bufio"
+	"bytes"
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+
+	"github.com/xypwn/filediver/config"
+	"github.com/xypwn/filediver/datalibrary/enum"
+)
+
+//go:embed planets.txt
+var planets []byte
+
+var ConfigFields *config.FieldSet
+
+func init() {
+	ConfigFields = config.MustFields(Config{})
+	var _ = GetTypeFormats(Config{}) // config sanity check (see GetTypeFormats)
+
+	planetsScanner := bufio.NewScanner(bytes.NewReader(planets))
+	ConfigFields.ByName["Planet.Name"].Options = []string{"<none>"}
+	for planetsScanner.Scan() {
+		ConfigFields.ByName["Planet.Name"].Options = append(ConfigFields.ByName["Planet.Name"].Options, planetsScanner.Text())
+	}
+
+	ConfigFields.ByName["Planet.Region"].Options = slices.Sorted(maps.Keys(enum.LevelGenerationRegionVariantFriendlyMap))
+	ConfigFields.ByName["Planet.SubRegion"].Options = slices.SortedFunc(maps.Keys(enum.SubRegionFriendlyMap), func(a, b string) int {
+		if a == "<random>" {
+			return -1
+		}
+		if b == "<random>" {
+			return 1
+		}
+		if len(a) == 1 && len(b) > 1 {
+			return -1
+		} else if len(b) == 1 && len(a) > 1 {
+			return 1
+		}
+		return strings.Compare(a, b)
+	})
+}
+
+// This is the central config structure used in the GUI
+// and CLI.
+// Tags starting with "t:" are custom and used to
+// identify which game file types the category
+// is targeting.
+type Config struct {
+	Gamedir string `cfg:"short=g tags=directory default=<auto-detect> help='Helldivers 2 game directory'"`
+	Audio   struct {
+		Format string `cfg:"options=ogg,wav,aac,mp3,wwise,raw help='common media formats: ogg,wav,aac,mp3; wwise to extract as wem/bnk'"`
+	} `cfg:"tags=t:wwise_stream,t:wwise_bank help='audio collections/streams'"`
+	Video struct {
+		Format string `cfg:"options=bk2,mp4,raw help='bk2 is raw bink2 video (use RAD Video Tools to convert); mp4 has artifacts due to incomplete decoder implementation'"`
+	} `cfg:"tags=t:bk2 help='video streams'"`
+	Texture struct {
+		Format string `cfg:"options=png,dds,raw"`
+	} `cfg:"tags=t:texture"`
+	Unit struct {
+		SingleFile            bool   `cfg:"help='combine all units into a single blend/glb file'"`
+		ImageFormat           string `cfg:"tags=advanced options=png,jpeg"`
+		PngCompression        string `cfg:"tags=advanced depends=Unit.ImageFormat=png options=default,none,fast,best"`
+		JpegQuality           int    `cfg:"tags=advanced depends=Unit.ImageFormat=jpeg range=1...100 default=90"`
+		AllTextures           bool   `cfg:"tags=advanced help='include all referenced textures, including wounds, marks etc. and unknown ones'"`
+		AccurateOnly          bool   `cfg:"tags=advanced"`
+		SampleAnimations      bool   `cfg:"help='more accurate for now, as spline interpolation conversion isn\\'t implemented yet'"`
+		AnimationSampleRate   int    `cfg:"depends=Unit.SampleAnimations range=12...144 default=30"`
+		EntityName            string `cfg:"tags=advanced help='Defaults to unit name when not provided, can be used to override what entity is used to source skins'"`
+		EntityOverrideDefault bool   `cfg:"tags=advanced help='Use the first material swap material slot value as the default material, otherwise use it as a variant'"`
+	} `cfg:"help='general unit settings, affects materials, models and animations'"`
+	Material struct {
+		Format         string `cfg:"options=blend,glb,folder,raw help='material export format; folder dumps all referenced textures and shaders (if enabled in advanced settings) into a folder'"`
+		TexturesFormat string `cfg:"depends=Material.Format=folder options=png,dds help='format of individual textures if Format is folder'"`
+		ShaderFormat   string `cfg:"tags=advanced depends=Material.Format=folder options=none,dxbc,glsl help='material shader export format; if set to either dxbc or glsl will dump the shaders for the material in that format in the shaders/ subdirectory of the material folder'"`
+	} `cfg:"tags=t:material help='see unit options'"`
+	Model struct {
+		Format                    string `cfg:"options=blend,glb,gltf,raw help='model export format'"`
+		IncludeLODS               bool   `cfg:"help='include meshes of all levels-of-detail'"`
+		IncludeGibs               bool   `cfg:"help='include meshes with gib materials'"`
+		EnableAnimations          bool   `cfg:"help='export model animations, can take much longer'"`
+		EnableAnimationController bool   `cfg:"tags=advanced depends=Model.EnableAnimations help='export model animation controller, can take even longer and will add many constraints to the output blend file'"`
+		JoinComponents            bool   `cfg:"tags=advanced help='join UDIM components'"`
+		BoundingBoxes             bool   `cfg:"tags=advanced help='export model bounding boxes'"`
+		NoBones                   bool   `cfg:"tags=advanced help='don\\'t include bones'"`
+	} `cfg:"tags=t:unit,t:geometry_group help='see unit options'"`
+	Animation struct {
+		Format string `cfg:"options=json,raw"`
+	} `cfg:"tags=t:animation,t:state_machine help='see unit options'"`
+	Level struct {
+		Format string `cfg:"options=model,json,raw"`
+	} `cfg:"tags=t:level help='Level specific settings'"`
+	Prefab struct {
+		Format string `cfg:"options=model,json,raw"`
+	} `cfg:"tags=t:prefab help='Prefab specific settings'"`
+	Text struct {
+		Format string `cfg:"options=json,raw"`
+	} `cfg:"tags=t:strings,t:package,t:bones help='only-text-exportable formats'"`
+	ShadingEnvironment struct {
+		Format string `cfg:"options=json,raw"`
+	} `cfg:"tags=t:entity,t:shading_environment_mapping,t:shading_environment help='Shading environment configuration file export settings'"`
+	SpeedTree struct {
+		Format string `cfg:"options=model,json,raw"`
+	} `cfg:"tags=t:speedtree help='Tree model export format'"`
+	XAML struct {
+		Format string `cfg:"options=svg,xaml,raw"`
+	} `cfg:"tags=t:xaml help='XAML can be opened as XAML in Noesis Studio; only XAML files of type ResourceDictionary which contain vector graphics can be exported as SVG'"`
+	Raw struct {
+		Format string `cfg:"options=separate,combined,main,stream,gpu help='how to handle the different file sub-types (each file may have a main, stream and GPU file)'"`
+	} `cfg:"help='applies to any file without an available extractor or \"raw\" as the selected format'"`
+	Planet struct {
+		Name      string `cfg:"help='Name of planet to use for asset customization' truncate"`
+		City      bool   `cfg:"help='Use city-specific overrides'"`
+		Region    string `cfg:"help='Planet region to use for asset customization' truncate"`
+		SubRegion string `cfg:"help='Subregion to use for asset customization' truncate"`
+	} `cfg:"help='Apply overrides from a specific planet to the exported assets'"`
+}
+
+// Config must be comparable
+var _ = Config{} == Config{}
+
+// Replaces c with preferences in JSON file specified by path.
+// Leaves c unchanged if an error occurs. If the file isn't present,
+// attempts to write the current state of p to the file.
+func (c *Config) Load(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return c.Save(path)
+		}
+		return err
+	}
+	newC := *c
+	if err := json.Unmarshal(b, &newC); err != nil {
+		return err
+	}
+	*c = newC
+	return nil
+}
+
+func (c *Config) Save(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path),
+		os.ModePerm); err != nil {
+		return err
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0666)
+}
+
+var Extractable = map[string]bool{
+	"wwise_stream":   true,
+	"wwise_bank":     true,
+	"bik":            true,
+	"material":       true,
+	"texture":        true,
+	"unit":           true,
+	"speedtree":      true,
+	"geometry_group": true,
+	"prefab":         true,
+	"level":          true,
+	"state_machine":  true,
+	"animation":      true,
+	"strings":        true,
+	"package":        true,
+	"bones":          true,
+	"ttf":            true,
+	"otf":            true,
+	"xaml":           true,
+}
+
+// GetTypeFormats maps each affected type
+// (denoted by t:<type> tag in config struct) to
+// the selected format.
+// Panics if two different t: tags reference the
+// same type.
+func GetTypeFormats(extrCfg Config) map[string]string {
+	val := reflect.ValueOf(extrCfg)
+
+	formatByType := map[string]string{}
+	for _, f := range ConfigFields.Fields {
+		if !f.IsCategory {
+			continue
+		}
+		formatFieldName := f.Name + ".Format"
+		if _, ok := ConfigFields.ByName[formatFieldName]; !ok {
+			continue
+		}
+		v := val
+		for name := range strings.SplitSeq(formatFieldName, ".") {
+			v = v.FieldByName(name)
+		}
+		if v.Kind() != reflect.String {
+			continue
+		}
+		format := v.String()
+		for _, tag := range f.Tags {
+			if after, ok := strings.CutPrefix(tag, "t:"); ok {
+				if _, exists := formatByType[after]; exists {
+					panic("GetTypeFormats: game file type " + after + " referenced by multiple categories")
+				}
+				formatByType[after] = format
+			}
+		}
+	}
+	return formatByType
+}

@@ -1,0 +1,232 @@
+# Guarded support-weapon authoring
+
+HD2Runtime 0.20 keeps the graph-aware 35-weapon inspection catalog and enables guarded
+authoring for the 27 uniquely resolved runtime identities. The eight duplicate groups remain
+visible through `describe()` and `attacks()`, but patch, transaction, and plan validation rejects
+them before runtime discovery. No duplicate root is chosen by score or list order.
+
+The normal semantic field constants are reused. A projectile target can edit `projectile.*` and
+linked `damage.*` fields, while an explosion target can edit `explosion.*` and
+`explosion.damage_*` fields. Definitions are shared runtime objects, so settings edits require
+`allow_shared=true`.
+
+```lua
+local hd2=require('mods/skyeshade/hd2runtime')
+local gr8=hd2.support_weapon('GR-8 Recoilless Rifle')
+local projectile=gr8:attack('primary'):projectile()
+local explosion=gr8:attack('primary_impact'):explosion()
+
+return hd2.ensure({
+    plan={
+        id='recoilless-proof',
+        operations={
+            {id='physics',target=projectile,allow_shared=true,
+                field=hd2.fields.projectile.velocity,expect=250,value=500},
+            {id='blast-radius',target=explosion,allow_shared=true,
+                field=hd2.fields.explosion.outer_radius,expect=3,value=12},
+            {id='blast-damage',target=explosion,allow_shared=true,
+                field=hd2.fields.explosion.damage_standard_damage,expect=150,value=1000},
+        },
+    },
+})
+```
+
+`ARC-3 Arc Thrower` exposes `arc.*`, `damage.*`, `status.*`, and `charge.*`. Its native fire-rate
+value is the `-1` charge-controlled sentinel, so `weapon.fire_rate` is intentionally absent.
+`RS-422 Railgun` exposes the resolved primary projectile and charge component; the catalog's
+intentional Max Charge unknown branch remains unresolved. Spray and melee attacks expose their
+owned DamageInfo fields, and resolved status branches expose strength and duration.
+
+C4 resolves through `ExplosiveComponentData` to its detonation `ExplosionSettings`. Solo Silo
+keeps the full stratagem payload -> `HellpodRackComponentData` -> missile entity chain. Every Solo
+Silo write freshly verifies that chain, then resolves the independently owned detonation or impact
+explosion. The handheld or delivery root is never treated as the damage owner.
+
+Weapon-side magazine and rounds-feed fields are independent of backpack storage. The three
+backpack-fed weapons (M-1000 Maxigun, B/FLAM-80 Cremator, GL-28 Belt-Fed Grenade Launcher) own no
+magazine at all: their ammunition is the backpack's `DepositComponent`, authored through
+`hd2.support_weapon(name):backpack()` (see [Backpack ammunition](backpack-ammo.md)). Other
+backpack-dependent weapons keep backpack storage read-only.
+
+LAS-98 uses the 0.18 `WeaponHeatComponentData` layout in the retained snapshot, including heat
+capacity, generation, cooling, and heatsinks. Its runtime roots are still unresolved (see below),
+so both heat and beam writes remain blocked.
+
+## Projectile swaps (support hosts)
+
+Eight support weapons are projectile hosts: APW-1, EAT-17, EAT-411, EAT-700, GL-21, M-105 Stalwart, MG-206 HMG and
+S-11 Speargun. They pass the same rule as player component hosts: magazine-fed, and every shot is their own
+ProjectileWeapon +0. `hd2.fields.attack.projectile` on `support:attack(role)` replaces what they fire. The donor is
+any catalogued projectile output or another weapon's attack projectile handle, from any loadout slot. The support host
+path is not live-proven yet, so it needs `allow_unverified_effect`; cross-class donors also need
+`allow_unverified_reference`. `support:projectile_source()` gives the target, field and expect, or the reason a
+support weapon is read-only. See [attack outputs](attack-outputs.md) (support hosts, one donor pool).
+
+```lua
+local eat=hd2.support_weapon('EAT-17 Expendable Anti-Tank')
+local source=eat:projectile_source()
+hd2.ensure({transaction={id='eat-scorcher',target=source.target,allow_unverified_effect=true,
+    changes={{field=source.field,expect=source.expect,value=hd2.weapon('PLAS-1 Scorcher'):attack('primary'):projectile()}}}})
+```
+
+## 0.24 coverage
+
+Evidence: `research/support-weapon-coverage-F5FEE03DCFDB.json`, produced by
+`scripts/research_support_weapon_coverage.py`. The live snapshot proves every relied-on native
+table is byte-identical to the pinned reference; scraped values are fingerprints only.
+
+| Field | Native owner | Evidence | Writable where |
+| --- | --- | --- | --- |
+| `projectile.lifetime` | `ProjectileInfo` +52 | Type-library member name length 9 (`life_time`); 5/5 exact scraped matches, 0/5 at the competing +56 | Native lifetime is non-zero (LAS-99, PLAS-45, RL-77, RS-422, S-11). A 0 lifetime means "no explicit limit" and stays read-only. |
+| `projectile.penetration_slowdown` | `ProjectileInfo` +64 | Name length 20; 27/27 exact matches, 1/27 at +56 | Every resolved projectile branch |
+| `reload.duration` | `WeaponReloadComponentData` +56 | Name length 8 (`duration`); scraped reload times agree only approximately | Native duration is non-zero (14 weapons). **Requires `allow_unverified_effect=true`.** A 0 duration means the reload ability's default applies and stays read-only. |
+| `windup.wind_up_seconds` | `WeaponWindUpComponentData` +0 | Name length 12; exact scraped match (Maxigun 0.5 s) | M-1000 Maxigun |
+| `windup.wind_down_seconds` | `WeaponWindUpComponentData` +4 | Name length 14; no scraped value | M-1000 Maxigun. **Requires `allow_unverified_effect=true`.** |
+
+Projectile fields live on shared definitions and need `allow_shared=true`, like the other
+`projectile.*` fields. Filediver labels +56 as `LifeTime`; the type library and the correlation
+both contradict that for this build.
+
+```lua
+local mg43=hd2.support_weapon('MG-43 Machine Gun')
+hd2.ensure({patch={id='mg43-reload',target=mg43,allow_unverified_effect=true,
+    field=hd2.fields.reload.duration,expect=4.5,value=3}})
+```
+
+### Delivery-resolved identities
+
+Duplicate groups used to be blocked as a whole. Each root in these groups owns separate component
+records, so the only open question was which root the player receives. A group is now resolved
+(`identityStatus` `DELIVERY_RESOLVED`) only when both are true:
+
+1. The linked call-in StratagemDefinition's hellpod rack attaches exactly one candidate root.
+2. An independent proof names that same root, and no other candidate:
+   - `WIKI_MAGAZINE`: its native magazine tuple (capacity, starting, from supply, spare) alone matches
+     the scraped values;
+   - `LOADOUT_PACKAGE`: the call-in's own package is exactly that root's loadout package;
+   - `SUPPORT_WEAPON_PATH`: it is the only candidate whose resource path lies under the carried
+     support-weapon equipment tree. The path is a `hashes.txt` string whose resource hash equals the
+     root, so it names the asset rather than guessing.
+
+`identityResolution.basis` is `call_in_delivery_and_scraped_fingerprint` when the magazine proof applies,
+otherwise `call_in_delivery_and_structural_identity`. `identityResolution.confirmations` lists every proof
+that applies.
+
+| Weapon | Result |
+| --- | --- |
+| MG-43 Machine Gun | Resolved. Delivered root 175/2/2/3 matches; the other root is 175/30/6/12. |
+| M-105 Stalwart | Resolved. Delivered root 250/2/2/3 matches; three other roots are 150/0/0/0. |
+| MG-206 Heavy Machine Gun | Resolved. Delivered root 100/1/2/2 matches; the FRV gun and another root differ. |
+| CQC-20 Breaching Hammer | Resolved. Delivered root 1/7/7/7 matches; the other root has no magazine. |
+| EAT-17 Expendable Anti-Tank | Resolved (`SUPPORT_WEAPON_PATH`). The delivered root is `equipment/support_weapons/lat_oneshot`; the other root has no resource path and no showcase, encyclopedia or customization component. Both roots have identical magazines, so the magazine proof cannot apply. |
+| LAS-98 Laser Cannon | Resolved (`SUPPORT_WEAPON_PATH`). The delivered root is `equipment/support_weapons/laser_cannon`; the others are the hellpod laser turret and an unnamed emplacement weapon. The native reload (5.0 s) still disagrees with the scraped 3.65 s. That is a value question, not an identity one. |
+| B/FLAM-80 Cremator | Resolved (`LOADOUT_PACKAGE`, `SUPPORT_WEAPON_PATH`). The delivered root is `equipment/support_weapons/heavy_flamethrower`. The other root is the Exosuit flamethrower mount (`vehicles/combat_walker_flamethrower`), whose package is empty. The scraped 500 capacity is the backpack fuel; the handheld has no magazine record. |
+| CQC-72 Entrenchment Tool | Blocked. Its two native roots share one package and matching melee records; one is a `SupportWeapon` loadout item and the other a `SidearmWeapon` item. It has no call-in (state `no_call_in`). |
+
+Resolved weapons reuse the Solo Silo chain check: every write re-proves live that the call-in
+StratagemDefinition payload is the rack and that the rack attaches the delivered root. Fields
+edit only the delivered weapon. Other native roots with the same catalog name (vehicle,
+emplacement, or mission variants) keep their own records, although shared settings rows still
+require `allow_shared`.
+
+The GUI-facing `SupportWeaponAuthoringCapabilities.json` schema v2 reports every weapon, catalog
+branch, writable fields by domain, shared scopes, blocked fields and exact reasons, backpack
+dependency, and linked stratagem status. Its canonical `fieldInstances` collection contains one
+entry for every internal authoring descriptor. Each entry includes the exact baseline, API field
+constant, attack-qualified target, semantic backing-object key, complete reviewed consumer scope,
+shared acknowledgement key, and transaction/plan grouping keys. `backingObjects` and
+`operationGroups` provide deduplicated joins for building one transaction per accepted Runtime
+backing scope and one plan across related objects.
+
+The older `weapons[].writableFieldsByDomain` lookup remains available as a deduplicated
+compatibility view. It must not be used to enumerate authoring instances because equal field names
+on different attacks or backing objects intentionally remain separate in `fieldInstances`.
+
+Semantic object and instance keys are stable opaque digests of reviewed identities. The artifact
+contains no runtime addresses, offsets, record IDs, resource hashes, projectile IDs, or explosion
+IDs. The older `SupportWeaponCapabilities.json` remains as the detailed inspection/evidence
+artifact.
+
+Snapshot validation resolves all promoted fields through production ownership chains and applies
+their current values as guarded no-ops. The checked result must be `ALREADY_DESIRED`, with zero
+writes, zero protection changes, stable rereads, and fixture fallback disabled.
+
+## Support call-in linkage
+
+Support weapons and their call-in stratagems remain separate authoring targets:
+`hd2.support_weapon(...)` edits the delivered weapon, and `hd2.stratagem(...)` edits the call-in
+definition. Since 0.22.1, both capability catalogs publish the reviewed relationship between them,
+so tools can present one merged view without matching display names or using private tables.
+
+Every support weapon has a stable `semanticId` (`support-weapon/v1/...`) and every stratagem has a
+stable `semanticId` (`stratagem/v1/...`). These IDs are opaque digests of semantic identity and are
+safe to persist. `weapons[].linkedStratagem` holds the forward link and support
+`stratagems[].delivers` holds the reverse link. Both catalogs carry the same
+`supportCallInLinks.relationships` collection. Use its `relationshipId`
+(`support-callin/v1/...`) as the merge key.
+
+Links are proven structurally. Either the call-in StratagemDefinition's primary payload is the
+support weapon's own runtime root, or it is a hellpod rack that attaches one of the weapon's runtime
+resources. The historical stratagem debug-name table is only a cross-check, and generation fails if
+the two disagree. The generator also fails on any one-way link.
+
+| State | Support weapons |
+| --- | --- |
+| `linked` | 33, including MS-11 Solo Silo (special: `deployable_silo`) and B/MD C4 Pack (special: `placed_item`) |
+| `no_call_in` | SG-88 Break-Action Shotgun, CQC-72 Entrenchment Tool |
+| `unresolved_call_in`, `unresolved_delivery` | none |
+
+A second, independent native identity corroborates the payload graph. Each loadout item's
+`LoadoutEntryComponent` carries an item id and a `LoadoutItemType`. For 29 of the 33 linked
+support weapons the item id is the id of the call-in StratagemDefinition. The generator fails if
+an item id ever names a different call-in than the structural link.
+
+- **B/MD C4 Pack** (`placed_item`). The call-in rack attaches the detonator (the thrower) and the
+  backpack; the backpack's deposit refills the detonator. The placed charge, which the catalog
+  identifies as C4, is linked because both of these hold: its loadout item id is the C4 call-in
+  id, and the call-in's package is its package. That package is owned only by the rack, the
+  detonator, the backpack, and the charge. The `deliveryGraph` keeps them separate: call-in
+  (cooldown) -> rack items `thrower` and `backpack` (native-only nodes, no authoring view) ->
+  placed charge (the support-weapon view) -> `detonation` explosion.
+- **SG-88 and CQC-72** (`no_call_in`). No StratagemDefinition carries their loadout item ids or
+  names their packages. No rack, deposit, entity delta, or other entity record references them.
+  `noCallIn` gives the reason, the root `loadoutItemTypes`, and a catalog-sourced
+  `acquisition` of `world_pickup` with `nativeDeliveryProven=false`: only the absence of a call-in
+  is native. On the stratagem side their `rootResolution` is `NO_CALL_IN`.
+
+A relationship alone never lifts support-weapon write blocking. Every linked duplicate group
+(MG-43, M-105, MG-206, CQC-20, EAT-17, LAS-98 and B/FLAM-80) is resolved only because an independent
+proof also names the delivered root: scraped magazine values, the call-in's package, or a
+hash-verified support-weapon resource path (see "Delivery-resolved identities"). No linked support
+weapon remains ambiguous. CQC-72 is an unlinked duplicate and stays blocked.
+
+Each relationship has a reference-only `deliveryGraph`. Its nodes name the owning view
+(`stratagem` or `support_weapon`), the semantic ID, and the target path or attack role. An editor
+uses these to select existing `fieldInstances`; no fields are copied. For Solo Silo the graph is
+stratagem call-in (cooldown) -> deployable silo -> missile -> `detonation` and `impact`
+explosions. Edits still persist through the original target types.
+
+## Equipment coverage (research/equipment-coverage-F5FEE03DCFDB.json)
+
+- **LAS-98 Laser Cannon `beam.fire_rate`** (`BeamWeaponComponentData` +104, rpm, 60): how often the beam applies its
+  damage. It is the published "Beam Fire Rate" on seven weapons, including the two non-60 values (LAS-13 Trident
+  300, 40-K Meltagun 50). Already authored before this pass: beam length and radius, damage and armor
+  penetration, heat, cooling, heatsinks, reload, handling, stationary firing and the Fire status. The published
+  cooling triple (7.5 - 5 - 3.8) is the cool rate times the native 1.5 / 0.75 multipliers
+  (`heat.cool_per_second_cold` / `_hot`, derived and read-only). The published 0.5 s warmup is stored in no common
+  member: not located.
+- **M-1000 Maxigun `weapon.recoil_multiplier_horizontal` / `weapon.recoil_multiplier_vertical`**
+  (`WeaponDataComponentData` +60 / +64): the first pair of the typed `RecoilModifiers` struct. It is 1.0 on 364
+  of 366 weapon records, and no attachment patches it.
+
+Both need `allow_unverified_effect`.
+
+Maxigun Reimagined was reviewed as a research lead, not a source. Every edit it makes was located independently:
+
+- Already authored: its spread, sway, ergonomics, crosshair, mobile firing, wind-up, backpack, damage and status
+  edits. Its "companion record" is the Maxigun's own WeaponData record, addressed 16 bytes in.
+- Its selector and weapon-function binding are not reproduced: selectors are not authored on wind-up weapons, and
+  its rate slots X/Z are dormant.
+- Its projectile edit targets a ProjectileSettings row at 820 m/s. The Maxigun fires projectile 306 at 920 m/s,
+  the published M-1000 P, so that edit would change another weapon's projectile.
+- Its muzzle-effect and audio edits are ignored.

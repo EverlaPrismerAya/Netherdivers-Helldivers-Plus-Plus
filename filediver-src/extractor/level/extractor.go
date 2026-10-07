@@ -1,0 +1,514 @@
+package level
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/go-gl/mathgl/mgl32"
+	"github.com/qmuntal/gltf"
+	"github.com/xypwn/filediver/extractor"
+	"github.com/xypwn/filediver/extractor/entity"
+	extr_material "github.com/xypwn/filediver/extractor/material"
+	extr_prefab "github.com/xypwn/filediver/extractor/prefab"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/level"
+)
+
+type SimpleMetadata struct {
+	Names []string                `json:"names"`
+	Type  level.LevelMetadataType `json:"type"`
+	Value any                     `json:"value"`
+}
+
+type SimpleMaterialOverride struct {
+	Index     uint32            `json:"index"`
+	Materials map[string]string `json:"materials"`
+}
+
+type SimpleMaterial struct {
+	Slot string `json:"slot"`
+	Path string `json:"path"`
+}
+
+type SimplePrefab struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	stingray.Transform
+	UnkExtraRotation mgl32.Vec4 `json:"extra_rotation"`
+}
+
+type SimpleUnit struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+	Path string `json:"path"`
+	stingray.Transform
+	UnkFloats [6]float32 `json:"unk_floats"`
+}
+
+type SimpleSpeedtreeTransform struct {
+	Position    [4]float32 `json:"position"`
+	MinRotation [4]float32 `json:"min_rotation"`
+	MaxRotation [4]float32 `json:"max_rotation"`
+}
+
+type SimpleSpeedtreeLayer struct {
+	Name     string `json:"name"`
+	UnkInt00 uint32 `json:"unk_int00"`
+	UnkInt01 uint32 `json:"unk_int01"`
+}
+
+type SimpleSpeedtree struct {
+	Path                string                     `json:"path"`
+	Layers              []SimpleSpeedtreeLayer     `json:"layers"`
+	SpeedtreeTransforms []SimpleSpeedtreeTransform `json:"transforms"`
+}
+
+type SimpleEmbeddedPrefabTransform struct {
+	Hash string `json:"hash"`
+	stingray.Transform
+	UnkFloats [6]float32 `json:"unk_floats"`
+}
+
+type SimpleHashIndexRange struct {
+	Hash  string `json:"hash"`
+	Start uint32 `json:"start"`
+	End   uint32 `json:"end"`
+}
+
+type SimpleEmbeddedPrefab struct {
+	Transform SimpleEmbeddedPrefabTransform `json:"header"`
+	Prefab    extr_prefab.SimplePrefab      `json:"prefab"`
+}
+
+type SimpleLevel struct {
+	Name                         string                   `json:"name"`
+	Metadata                     map[int][]SimpleMetadata `json:"metadata"`
+	MaterialOverrides            []SimpleMaterialOverride `json:"material_overrides"`
+	Units                        []SimpleUnit             `json:"units"`
+	Prefabs                      []SimplePrefab           `json:"prefabs"`
+	EmbeddedPrefabs              []SimpleEmbeddedPrefab   `json:"embedded_prefabs"`
+	Speedtrees                   []SimpleSpeedtree        `json:"speedtrees"`
+	Entity                       *entity.SimpleEntity     `json:"entity"`
+	UnitHashIndexRange           []SimpleHashIndexRange   `json:"unit_hash_index_range"`
+	UnkHashIndexRange1           []SimpleHashIndexRange   `json:"unk_hash_index_range_1"`
+	UnkHashIndexRange2           []SimpleHashIndexRange   `json:"unk_hash_index_range_2"`
+	UnkHashIndexRange3           []SimpleHashIndexRange   `json:"unk_hash_index_range_3"`
+	PrefabHashIndexRange         []SimpleHashIndexRange   `json:"prefab_hash_index_range"`
+	EmbeddedPrefabHashIndexRange []SimpleHashIndexRange   `json:"embedded_prefab_hash_index_range"`
+	UnkHashIndexRange5           []SimpleHashIndexRange   `json:"unk_hash_index_range_5"`
+}
+
+func ExtractLevelJSON(ctx *extractor.Context) error {
+	r, err := ctx.Open(ctx.FileID(), stingray.DataMain)
+	if err != nil {
+		return err
+	}
+	levelData, err := level.LoadLevel(r, ctx.EntityVarMapping())
+	if err != nil {
+		return err
+	}
+	metadata := make(map[int][]SimpleMetadata)
+	for key, entries := range levelData.Metadata {
+		metadata[key] = make([]SimpleMetadata, 0)
+		for _, entry := range entries {
+			varNames := make([]string, 0)
+			for _, name := range entry.VariableNames {
+				varNames = append(varNames, ctx.LookupThinHash(name))
+			}
+			simpleEntry := SimpleMetadata{
+				Names: varNames,
+				Type:  entry.Type,
+			}
+			switch entry.Type {
+			case level.LevelMetadata_uint32:
+				simpleEntry.Value = entry.ValueUint
+			case level.LevelMetadata_float32:
+				simpleEntry.Value = entry.ValueFloat
+			case level.LevelMetadata_string:
+				simpleEntry.Value = entry.ValueString
+			}
+			metadata[key] = append(metadata[key], simpleEntry)
+		}
+	}
+
+	prefabs := make([]SimplePrefab, 0)
+	for _, prefab := range levelData.Prefabs {
+		prefabs = append(prefabs, SimplePrefab{
+			Name:             ctx.LookupHash(prefab.Name),
+			Path:             ctx.LookupHash(prefab.Path),
+			Transform:        prefab.Transform,
+			UnkExtraRotation: prefab.UnkExtraRotation,
+		})
+	}
+
+	speedtrees := make([]SimpleSpeedtree, 0)
+	for _, speedtree := range levelData.Speedtrees {
+		layers := make([]SimpleSpeedtreeLayer, 0)
+		for _, layer := range speedtree.Layers {
+			layers = append(layers, SimpleSpeedtreeLayer{
+				Name:     ctx.LookupThinHash(layer.Name),
+				UnkInt00: layer.UnkInt00,
+				UnkInt01: layer.UnkInt01,
+			})
+		}
+		transforms := make([]SimpleSpeedtreeTransform, 0)
+		for _, transform := range speedtree.Transforms {
+			transforms = append(transforms, SimpleSpeedtreeTransform{
+				Position:    transform.Position,
+				MinRotation: transform.MinRotation,
+				MaxRotation: transform.MaxRotation,
+			})
+		}
+		speedtrees = append(speedtrees, SimpleSpeedtree{
+			Path:                ctx.LookupHash(speedtree.Path()),
+			Layers:              layers,
+			SpeedtreeTransforms: transforms,
+		})
+	}
+
+	materialOverrides := make([]SimpleMaterialOverride, 0)
+	for idx, materialOverride := range levelData.MaterialOverrides {
+		materials := make(map[string]string)
+		for slot, material := range materialOverride {
+			materials[ctx.LookupThinHash(slot)] = ctx.LookupHash(material)
+		}
+		materialOverrides = append(materialOverrides, SimpleMaterialOverride{
+			Index:     uint32(idx),
+			Materials: materials,
+		})
+	}
+
+	units := make([]SimpleUnit, 0)
+	for _, unit := range levelData.Units {
+		units = append(units, SimpleUnit{
+			UUID:      ctx.LookupHash(unit.UUID),
+			Name:      ctx.LookupHash(unit.Name),
+			Path:      ctx.LookupHash(unit.Path()),
+			Transform: unit.Transform,
+			UnkFloats: unit.UnkFloats,
+		})
+	}
+
+	var simpleEntity *entity.SimpleEntity
+	if levelData.Entity != nil {
+		simpleEntity = &entity.SimpleEntity{}
+		simpleEntity.FromEntity(ctx, levelData.Entity)
+	}
+
+	embeddedPrefabs := make([]SimpleEmbeddedPrefab, 0)
+	for _, item := range levelData.EmbeddedPrefabs {
+		embeddedPrefabs = append(embeddedPrefabs, SimpleEmbeddedPrefab{
+			Transform: SimpleEmbeddedPrefabTransform{
+				Hash:      ctx.LookupHash(item.Hash),
+				Transform: item.Transform,
+				UnkFloats: item.UnkFloats,
+			},
+			Prefab: extr_prefab.ToSimple(ctx, item.Prefab),
+		})
+	}
+
+	outData := SimpleLevel{
+		Name:              ctx.LookupHash(levelData.Name),
+		Metadata:          metadata,
+		Prefabs:           prefabs,
+		MaterialOverrides: materialOverrides,
+		Units:             units,
+		Speedtrees:        speedtrees,
+		Entity:            simpleEntity,
+		EmbeddedPrefabs:   embeddedPrefabs,
+	}
+
+	if levelData.UnitHashIndexRange != nil {
+		outData.UnitHashIndexRange = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.UnitHashIndexRange {
+			outData.UnitHashIndexRange = append(outData.UnitHashIndexRange, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.UnkHashIndexRange1 != nil {
+		outData.UnkHashIndexRange1 = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.UnkHashIndexRange1 {
+			outData.UnkHashIndexRange1 = append(outData.UnkHashIndexRange1, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.UnkHashIndexRange2 != nil {
+		outData.UnkHashIndexRange2 = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.UnkHashIndexRange2 {
+			outData.UnkHashIndexRange2 = append(outData.UnkHashIndexRange2, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.UnkHashIndexRange3 != nil {
+		outData.UnkHashIndexRange3 = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.UnkHashIndexRange3 {
+			outData.UnkHashIndexRange3 = append(outData.UnkHashIndexRange3, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.PrefabHashIndexRange != nil {
+		outData.PrefabHashIndexRange = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.PrefabHashIndexRange {
+			outData.PrefabHashIndexRange = append(outData.PrefabHashIndexRange, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.EmbeddedPrefabHashIndexRange != nil {
+		outData.EmbeddedPrefabHashIndexRange = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.EmbeddedPrefabHashIndexRange {
+			outData.EmbeddedPrefabHashIndexRange = append(outData.EmbeddedPrefabHashIndexRange, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	if levelData.UnkHashIndexRange5 != nil {
+		outData.UnkHashIndexRange5 = make([]SimpleHashIndexRange, 0)
+		for _, hashIndexRange := range levelData.UnkHashIndexRange5 {
+			outData.UnkHashIndexRange5 = append(outData.UnkHashIndexRange5, SimpleHashIndexRange{
+				Hash:  ctx.LookupThinHash(hashIndexRange.Hash),
+				Start: hashIndexRange.Start,
+				End:   hashIndexRange.End,
+			})
+		}
+	}
+
+	out, err := ctx.CreateFile(".level.json")
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "    ")
+	if err := enc.Encode(outData); err != nil {
+		return err
+	}
+	return nil
+}
+
+type SpeedtreeTransformed struct {
+	level.Speedtree
+	stingray.Transform
+}
+
+func GetLevelExtrasID(fileId stingray.FileID) string {
+	return fileId.Name.String() + ".level"
+}
+
+func ConvertOpts(ctx *extractor.Context, gltfDoc *gltf.Document) error {
+	cfg := ctx.Config()
+	if cfg.Level.Format == "json" {
+		return ExtractLevelJSON(ctx)
+	}
+	r, err := ctx.Open(ctx.FileID(), stingray.DataMain)
+	if err != nil {
+		return err
+	}
+	levelData, err := level.LoadLevel(r, ctx.EntityVarMapping())
+	if err != nil {
+		return err
+	}
+	imgOpts, err := extr_material.GetImageOpts(ctx)
+	if err != nil {
+		return err
+	}
+
+	doc := extractor.GetDocument(ctx, gltfDoc)
+
+	extras, ok := doc.Extras.(map[string]any)
+	if !ok {
+		extras = make(map[string]any)
+	}
+
+	levelIdx := uint32(len(doc.Nodes))
+	doc.Nodes = append(doc.Nodes, &gltf.Node{
+		Name:     ctx.LookupHash(ctx.FileID().Name) + ".level",
+		Children: make([]uint32, 0),
+		Extras: map[string]any{
+			"node": levelIdx,
+			"hash": GetLevelExtrasID(ctx.FileID()),
+		},
+	})
+	doc.Scenes[0].Nodes = append(doc.Scenes[0].Nodes, levelIdx)
+	extras[GetLevelExtrasID(ctx.FileID())] = map[string]any{
+		"parent": nil,
+	}
+	doc.Extras = extras
+
+	totalObjectCount := float32(len(levelData.Units) + len(levelData.EmbeddedPrefabs) + len(levelData.Prefabs) + len(levelData.Speedtrees))
+	for idx, prefab := range levelData.Prefabs {
+		if ctxErr := ctx.Ctx().Err(); errors.Is(ctxErr, context.Canceled) {
+			return ctxErr
+		}
+		if ctx.FileID() == ctx.RootFileID() {
+			percentComplete := 100 * float32(idx+1) / totalObjectCount
+			ctx.Statusf("%.2f%% - %v.prefab", percentComplete, ctx.LookupHash(prefab.Path))
+		}
+		prefabId := ctx.OverrideAsset(stingray.NewFileID(prefab.Path, stingray.Sum("prefab")))
+		node, err := extr_prefab.AddPrefab(ctx.WithFileID(prefabId), doc, imgOpts)
+		if err != nil {
+			return err
+		}
+		extras, ok := doc.Extras.(map[string]any)
+		if !ok {
+			return fmt.Errorf("prefab export did not add extras? (should not happen)")
+		}
+		prefabMetadataIface, contains := extras[extr_prefab.GetPrefabExtrasID(prefabId)]
+		if !contains {
+			return fmt.Errorf("prefab export did not add metadata? (should not happen)")
+		}
+		prefabMetadata, ok := prefabMetadataIface.(map[string]any)
+		if !ok {
+			return fmt.Errorf("prefab metadata could not be converted? (should not happen)")
+		}
+		parentIface, contains := prefabMetadata["parent"]
+		if !contains {
+			return fmt.Errorf("prefab parent was not added? (should not happen)")
+		}
+		if _, ok := parentIface.(uint32); !ok {
+			// parent was nil
+			prefabMetadata["parent"] = levelIdx
+			extras[extr_prefab.GetPrefabExtrasID(prefabId)] = prefabMetadata
+			doc.Extras = extras
+		}
+
+		position, rotation, scale := prefab.ToGLTF()
+		doc.Nodes[node].Translation = position
+		doc.Nodes[node].Rotation = rotation
+		doc.Nodes[node].Scale = scale
+
+		doc.Nodes[levelIdx].Children = append(doc.Nodes[levelIdx].Children, node)
+	}
+
+	for idx, embedded := range levelData.EmbeddedPrefabs {
+		if ctxErr := ctx.Ctx().Err(); errors.Is(ctxErr, context.Canceled) {
+			return ctxErr
+		}
+		if ctx.FileID() == ctx.RootFileID() {
+			percentComplete := 100 * float32(idx+1) / totalObjectCount
+			ctx.Statusf("%.2f%% - %v.prefab (embedded)", percentComplete, ctx.LookupHash(embedded.EmbeddedPrefabTransform.Hash))
+		}
+		prefabId := ctx.OverrideAsset(stingray.NewFileID(embedded.EmbeddedPrefabTransform.Hash, stingray.Sum("prefab")))
+		node, err := extr_prefab.AddPrefabData(ctx.WithFileID(prefabId), doc, imgOpts, &embedded.Prefab)
+		if err != nil {
+			return err
+		}
+		extras, ok := doc.Extras.(map[string]any)
+		if !ok {
+			return fmt.Errorf("prefab export did not add extras? (should not happen)")
+		}
+		prefabMetadataIface, contains := extras[extr_prefab.GetPrefabExtrasID(prefabId)]
+		if !contains {
+			return fmt.Errorf("prefab export did not add metadata? (should not happen)")
+		}
+		prefabMetadata, ok := prefabMetadataIface.(map[string]any)
+		if !ok {
+			return fmt.Errorf("prefab metadata could not be converted? (should not happen)")
+		}
+		parentIface, contains := prefabMetadata["parent"]
+		if !contains {
+			return fmt.Errorf("prefab parent was not added? (should not happen)")
+		}
+		if _, ok := parentIface.(uint32); !ok {
+			// parent was nil
+			prefabMetadata["parent"] = levelIdx
+			extras[extr_prefab.GetPrefabExtrasID(prefabId)] = prefabMetadata
+			doc.Extras = extras
+		}
+
+		position, rotation, scale := embedded.ToGLTF()
+		doc.Nodes[node].Translation = position
+		doc.Nodes[node].Rotation = rotation
+		doc.Nodes[node].Scale = scale
+
+		doc.Nodes[levelIdx].Children = append(doc.Nodes[levelIdx].Children, node)
+	}
+
+	for idx, unit := range levelData.Units {
+		if ctxErr := ctx.Ctx().Err(); errors.Is(ctxErr, context.Canceled) {
+			return ctxErr
+		}
+		if ctx.FileID() == ctx.RootFileID() {
+			percentComplete := 100 * float32(idx+1+len(levelData.Prefabs)) / totalObjectCount
+			ctx.Statusf("%.2f%% - %v.unit", percentComplete, ctx.LookupHash(unit.Path()))
+		}
+		materialOverrides, ok := levelData.MaterialOverrides[idx]
+		if !ok {
+			materialOverrides = nil
+		}
+		metadata := make(map[string]any)
+		for _, entry := range levelData.Metadata[idx] {
+			metadata[entry.Key(ctx.LookupThinHash)] = entry.Value()
+		}
+		unitId := ctx.OverrideAsset(stingray.NewFileID(unit.Path(), stingray.Sum("unit")))
+		err := extr_prefab.AddOrDuplicateModel(ctx.WithFileID(unitId), doc, imgOpts, &unit, levelIdx, materialOverrides, metadata)
+		if err != nil {
+			return err
+		}
+	}
+
+	for idx, speedtree := range levelData.Speedtrees {
+		if ctxErr := ctx.Ctx().Err(); errors.Is(ctxErr, context.Canceled) {
+			return ctxErr
+		}
+		if ctx.FileID() == ctx.RootFileID() {
+			percentComplete := 100 * float32(idx+1+len(levelData.Prefabs)+len(levelData.Units)) / totalObjectCount
+			ctx.Statusf("%.2f%% - %v.speedtree", percentComplete, ctx.LookupHash(speedtree.Path()))
+		}
+		speedtreeId := ctx.OverrideAsset(stingray.NewFileID(speedtree.Path(), stingray.Sum("speedtree")))
+		for _, transform := range speedtree.Transforms {
+			speedtreeTransformed := SpeedtreeTransformed{
+				Speedtree: speedtree,
+				Transform: stingray.Transform{
+					PositionVec: transform.Position.Vec3(),
+					RotationVec: transform.MinRotation,
+					ScaleVec:    mgl32.Vec3{1, 1, 1},
+				},
+			}
+			err := extr_prefab.AddOrDuplicateModel(ctx.WithFileID(speedtreeId), doc, imgOpts, &speedtreeTransformed, levelIdx, nil, nil)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	extractor.ClearChildNodesFromScene(ctx, doc)
+
+	if gltfDoc == nil {
+		err := extractor.SaveDocument(ctx, doc, "level", cfg.Model.Format)
+		if err != nil {
+			return err
+		}
+	}
+	ctx.Statusf("Done")
+	return nil
+}
+
+func Convert(currDoc *gltf.Document) func(ctx *extractor.Context) error {
+	return func(ctx *extractor.Context) error {
+		return ConvertOpts(ctx, currDoc)
+	}
+}

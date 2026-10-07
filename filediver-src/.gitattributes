@@ -1,0 +1,4 @@
+# Don't include python scripts that aren't part of filediver itself
+scripts/resources/*.py -linguist-detectable
+# Auto detect text files and perform LF normalization
+* text=auto

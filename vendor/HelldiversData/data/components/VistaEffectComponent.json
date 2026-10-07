@@ -1,0 +1,3 @@
+{ "VistaEffectComponent" : {
+    "id" : { "type": "uint", "description": "[string]ID to trigger" }
+}}

@@ -1,0 +1,418 @@
+package extractor
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
+	"github.com/xypwn/filediver/app/appconfig"
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/datalibrary/enum"
+	"github.com/xypwn/filediver/exec"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/ah_bin"
+	"github.com/xypwn/filediver/stingray/shading_environment"
+)
+
+// Context is what's passed to the extractor when
+// extracting the file. The most useful methods are
+// [Context.FileID], [Context.Open] and [Context.CreateFile].
+//
+// A context should only be used once.
+type Context struct {
+	ctx                context.Context
+	hashes             map[stingray.Hash]string
+	thinHashes         map[stingray.ThinHash]string
+	armorSets          map[stingray.Hash]datalib.ArmorSet
+	skinOverrideGroups []datalib.UnitSkinOverrideGroup
+	weaponPaintSchemes []datalib.WeaponCustomizableItem
+	attachmentSlots    map[stingray.Hash]enum.WeaponCustomizationSlot
+	entityVarMapping   shading_environment.ShadingEnvironmentEntityToShaderMapping
+	planets            map[string]datalib.PlanetData
+	planetRegionsMap   map[stingray.ThinHash]datalib.GenerationRegionVariantList
+	environmentMap     map[enum.PlanetType]datalib.EnvironmentSettings
+	gameBuildInfo      *ah_bin.BuildInfo
+	languageMap        map[uint32]string
+	dataDir            *stingray.DataDir
+	runner             *exec.Runner
+	config             appconfig.Config
+	outPath            string
+	selectedArchives   []stingray.Hash
+	warnf              func(format string, args ...any)
+	statusf            func(format string, args ...any)
+
+	// Main file ID to extract
+	fileID stingray.FileID
+
+	// Initial file ID the root context was created with
+	rootFileID stingray.FileID
+
+	// Files created by the extractor so far
+	files []string
+
+	materialOverrides map[stingray.ThinHash]stingray.Hash
+	assetOverrides    map[stingray.FileID]stingray.FileID
+	colorGrading      stingray.Hash
+}
+
+// NewContext creates a new [Context].
+//
+// getFiles can be called when the extractor is
+// done to obtain a list of output files.
+func NewContext(
+	ctx context.Context,
+	fileID stingray.FileID,
+	hashes map[stingray.Hash]string,
+	thinHashes map[stingray.ThinHash]string,
+	armorSets map[stingray.Hash]datalib.ArmorSet,
+	skinOverrideGroups []datalib.UnitSkinOverrideGroup,
+	weaponPaintSchemes []datalib.WeaponCustomizableItem,
+	attachmentSlots map[stingray.Hash]enum.WeaponCustomizationSlot,
+	entityVarMapping shading_environment.ShadingEnvironmentEntityToShaderMapping,
+	planets map[string]datalib.PlanetData,
+	planetRegionsMap map[stingray.ThinHash]datalib.GenerationRegionVariantList,
+	environmentMap map[enum.PlanetType]datalib.EnvironmentSettings,
+	gameBuildInfo *ah_bin.BuildInfo,
+	languageMap map[uint32]string,
+	dataDir *stingray.DataDir,
+	runner *exec.Runner,
+	config appconfig.Config,
+	outPath string,
+	selectedArchives []stingray.Hash,
+	warnf func(format string, args ...any),
+	statusf func(format string, args ...any),
+) (_ *Context, getFiles func() []string) {
+	c := &Context{
+		ctx:                ctx,
+		hashes:             hashes,
+		thinHashes:         thinHashes,
+		armorSets:          armorSets,
+		skinOverrideGroups: skinOverrideGroups,
+		weaponPaintSchemes: weaponPaintSchemes,
+		attachmentSlots:    attachmentSlots,
+		entityVarMapping:   entityVarMapping,
+		planets:            planets,
+		planetRegionsMap:   planetRegionsMap,
+		environmentMap:     environmentMap,
+		gameBuildInfo:      gameBuildInfo,
+		languageMap:        languageMap,
+		dataDir:            dataDir,
+		runner:             runner,
+		config:             config,
+		outPath:            outPath,
+		selectedArchives:   selectedArchives,
+		warnf:              warnf,
+		statusf:            statusf,
+
+		fileID:     fileID,
+		rootFileID: fileID,
+
+		colorGrading: stingray.Hash{Value: 0x0},
+	}
+	return c, func() []string { return c.files }
+}
+
+// Ctx gets the cancellation context.
+func (c *Context) Ctx() context.Context {
+	return c.ctx
+}
+
+// Returns a copy of the context, to modify later
+func copyContext(c *Context) *Context {
+	return &Context{
+		ctx:                c.ctx,
+		hashes:             c.hashes,
+		thinHashes:         c.thinHashes,
+		armorSets:          c.armorSets,
+		skinOverrideGroups: c.skinOverrideGroups,
+		weaponPaintSchemes: c.weaponPaintSchemes,
+		attachmentSlots:    c.attachmentSlots,
+		entityVarMapping:   c.entityVarMapping,
+		planets:            c.planets,
+		planetRegionsMap:   c.planetRegionsMap,
+		environmentMap:     c.environmentMap,
+		gameBuildInfo:      c.gameBuildInfo,
+		languageMap:        c.languageMap,
+		dataDir:            c.dataDir,
+		runner:             c.runner,
+		config:             c.config,
+		outPath:            c.outPath,
+		selectedArchives:   c.selectedArchives,
+		warnf:              c.warnf,
+		statusf:            c.statusf,
+
+		materialOverrides: c.materialOverrides,
+		assetOverrides:    c.assetOverrides,
+		colorGrading:      c.colorGrading,
+
+		fileID:     c.fileID,
+		rootFileID: c.rootFileID,
+
+		files: c.files,
+	}
+}
+
+// Returns a copy of the context with the fileID changed
+func (c *Context) WithFileID(newFileID stingray.FileID) *Context {
+	newCtx := copyContext(c)
+	newCtx.fileID = newFileID
+	return newCtx
+}
+
+// Returns a copy of the context with different material overrides
+func (c *Context) WithMaterialOverrides(newOverrides map[stingray.ThinHash]stingray.Hash) *Context {
+	newCtx := copyContext(c)
+	newCtx.materialOverrides = newOverrides
+	return newCtx
+}
+
+// Returns a copy of the context with different asset overrides
+func (c *Context) WithAssetOverrides(newOverrides map[stingray.FileID]stingray.FileID) *Context {
+	newCtx := copyContext(c)
+	newCtx.assetOverrides = newOverrides
+	return newCtx
+}
+
+// Returns a copy of the context with different asset overrides
+func (c *Context) WithColorGrading(colorGrading stingray.Hash) *Context {
+	newCtx := copyContext(c)
+	newCtx.colorGrading = colorGrading
+	return newCtx
+}
+
+// Transparently return the override for a slot if it exists, otherwise return the original
+func (c *Context) OverrideMaterial(slot stingray.ThinHash, original stingray.Hash) stingray.Hash {
+	if c.materialOverrides == nil {
+		return original
+	}
+	if override, contains := c.materialOverrides[slot]; contains {
+		return override
+	}
+	return original
+}
+
+// Transparently return the override for an asset if it exists, otherwise return the original
+func (c *Context) OverrideAsset(asset stingray.FileID) stingray.FileID {
+	if c.assetOverrides == nil {
+		return asset
+	}
+	if override, contains := c.assetOverrides[asset]; contains {
+		return override
+	}
+	return asset
+}
+
+// Get the current context's color grading entity hash
+func (c *Context) ColorGrading() stingray.Hash {
+	return c.colorGrading
+}
+
+// FileID gets the ID of the current file to be extracted.
+func (c *Context) FileID() stingray.FileID {
+	return c.fileID
+}
+
+// RootFileID gets the ID of the root file to be extracted.
+func (c *Context) RootFileID() stingray.FileID {
+	return c.rootFileID
+}
+
+// Open opens the specified game file.
+// NOTE THAT THIS WILL PREALLOCATE ALL FILE DATA; use Exists()
+// to check if a file exists.
+func (c *Context) Open(id stingray.FileID, typ stingray.DataType) (io.ReadSeeker, error) {
+	b, err := c.Read(id, typ)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(b), nil
+}
+
+// Read reads the specified game file.
+// NOTE THAT THIS WILL PREALLOCATE ALL FILE DATA; use Exists()
+// to check if a file exists.
+func (c *Context) Read(id stingray.FileID, typ stingray.DataType) ([]byte, error) {
+	b, err := c.dataDir.Read(id, typ)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// Exists checks if the given file exists.
+func (c *Context) Exists(id stingray.FileID, typ stingray.DataType) bool {
+	files := c.dataDir.Files[id]
+	return len(files) > 0 && files[0].Exists(typ)
+}
+
+// Runner gets the runner.
+func (c *Context) Runner() *exec.Runner {
+	return c.runner
+}
+
+// Config gets the current extractor config.
+func (c *Context) Config() appconfig.Config {
+	return c.config
+}
+
+// CreateFile creates an output file.
+// Suffix is appended to the source file name/hash
+// and should be unique to the output format.
+// Call WriteCloser.Close() when done.
+func (c *Context) CreateFile(suffix string) (io.WriteCloser, error) {
+	path, err := c.AllocateFile(suffix)
+	if err != nil {
+		return nil, err
+	}
+	return os.Create(path)
+}
+
+// AllocateFile is similar to [Context.CreateFile], but you get to create
+// the file yourself.
+func (c *Context) AllocateFile(suffix string) (string, error) {
+	path := c.outPath + suffix
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return "", err
+	}
+	c.files = append(c.files, path)
+	return path, nil
+}
+
+// Hashes returns a map of known hashes.
+func (c *Context) Hashes() map[stingray.Hash]string {
+	return c.hashes
+}
+
+// ThinHashes returns a map of known thin hashes.
+func (c *Context) ThinHashes() map[stingray.ThinHash]string {
+	return c.thinHashes
+}
+
+// LanguageMap returns a map of localization strings.
+func (c *Context) LanguageMap() map[uint32]string {
+	return c.languageMap
+}
+
+func (c *Context) BuildInfo() *ah_bin.BuildInfo {
+	return c.gameBuildInfo
+}
+
+// GuessFileArmorSet uses the selected archives (-t option)
+// to guess which armor set the given file is meant to belong to.
+//
+// TODO: We might want to take a different approach to this,
+// since we can never truly be sure the archive/armor set ID
+// is correct.
+func (c *Context) GuessFileArmorSet(fileID stingray.FileID) (datalib.ArmorSet, bool) {
+	var archive stingray.Hash
+	for _, file := range c.dataDir.Files[fileID] {
+		if slices.Contains(c.selectedArchives, file.ArchiveID) {
+			archive = file.ArchiveID
+			break
+		}
+	}
+	if archive.Value == 0 {
+		return datalib.ArmorSet{}, false
+	}
+
+	armorSet, ok := c.armorSets[archive]
+	return armorSet, ok
+}
+
+func (c *Context) SelectedArchives() []stingray.Hash {
+	return c.selectedArchives
+}
+
+func (c *Context) ArmorSets() []datalib.ArmorSet {
+	toReturn := make([]datalib.ArmorSet, 0)
+	for _, archive := range c.selectedArchives {
+		armorSet, ok := c.armorSets[archive]
+		if !ok {
+			continue
+		}
+		toReturn = append(toReturn, armorSet)
+	}
+	return toReturn
+}
+
+func (c *Context) SkinOverrideGroups() []datalib.UnitSkinOverrideGroup {
+	return c.skinOverrideGroups
+}
+
+func (c *Context) WeaponPaintSchemes() []datalib.WeaponCustomizableItem {
+	return c.weaponPaintSchemes
+}
+
+func (c *Context) AttachmentSlots() map[stingray.Hash]enum.WeaponCustomizationSlot {
+	return c.attachmentSlots
+}
+
+func (c *Context) EntityVarMapping() shading_environment.ShadingEnvironmentEntityToShaderMapping {
+	return c.entityVarMapping
+}
+
+func (c *Context) Planets() map[string]datalib.PlanetData {
+	return c.planets
+}
+
+func (c *Context) GetPlanet() datalib.PlanetData {
+	caser := cases.Lower(language.English)
+	planetName := caser.String(c.config.Planet.Name)
+	planet, contains := c.planets[planetName]
+	if !contains {
+		return c.planets["super earth"]
+	}
+	return planet
+}
+
+func (c *Context) PlanetRegionsMap() map[stingray.ThinHash]datalib.GenerationRegionVariantList {
+	return c.planetRegionsMap
+}
+
+func (c *Context) EnvironmentMap() map[enum.PlanetType]datalib.EnvironmentSettings {
+	return c.environmentMap
+}
+
+// Warnf logs a user-visible warning message.
+// Use this when an error occurred, but extraction
+// can continue.
+func (c *Context) Warnf(format string, args ...any) {
+	c.warnf(format, args...)
+}
+
+// Statusf logs a user-visible info message.
+// Use this to display progress in long running extractions
+func (c *Context) Statusf(format string, args ...any) {
+	c.statusf(format, args...)
+}
+
+// LookupHash returns the cracked hash (if known), or the hex representation otherwise.
+func (c *Context) LookupHash(hash stingray.Hash) string {
+	if name, ok := c.hashes[hash]; ok {
+		return name
+	}
+	return hash.String()
+}
+
+// LookupThinHash returns the cracked thin hash (if known), or the hex representation otherwise.
+func (c *Context) LookupThinHash(hash stingray.ThinHash) string {
+	if name, ok := c.thinHashes[hash]; ok {
+		return name
+	}
+	return hash.String()
+}
+
+// LookupString returns the localized string for an ID or the hex representation if the ID is not present.
+func (c *Context) LookupString(id uint32) string {
+	if name, ok := c.languageMap[id]; ok {
+		return name
+	}
+	return strconv.FormatUint(uint64(id), 16)
+}

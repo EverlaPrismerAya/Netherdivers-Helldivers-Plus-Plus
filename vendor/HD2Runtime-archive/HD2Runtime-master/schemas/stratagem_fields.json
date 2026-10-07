@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "fields": [
+    {"id":"entity.health","display_name":"Main health","type":"integer","unit":"health","writable":true,"storage":"i32","component":"HealthComponentData","offset":0},
+    {"id":"entity.armor","display_name":"Main armor","type":"integer","unit":"armor_class","writable":true,"storage":"u32","component":"HealthComponentData","offset":280},
+    {"id":"stratagem.cooldown","display_name":"Cooldown","type":"number","unit":"seconds","writable":true,"storage":"f32"},
+    {"id":"stratagem.max_uses","display_name":"Mission uses","type":"stratagem_uses","unit":"uses","writable":true,"storage":"u32","reason":"StratagemInfo +80: an integer use count, or 'unlimited' (the native 0xFFFFFFFF value). Eagles use the same field for uses per rearm and are excluded."},
+    {"id":"eagle.uses_per_rearm","display_name":"Uses before rearm","type":"integer","unit":"uses","writable":true,"storage":"u32"},
+    {"id":"eagle.rearm_time","display_name":"Eagle rearm time","type":"number","unit":"seconds","writable":true,"storage":"f32"},
+    {"id":"orbital.duration","display_name":"Orbital attack duration","type":"number","unit":"seconds","writable":true,"storage":"f32"},
+    {"id":"orbital.movement_speed","display_name":"Orbital tracking speed","type":"number","unit":"meters_per_second","writable":true,"storage":"f32"},
+    {"id":"orbital.search_radius","display_name":"Orbital search radius","type":"number","unit":"meters","writable":true,"storage":"f32"},
+    {"id":"orbital.tick_interval","display_name":"Orbital damage tick interval","type":"number","unit":"seconds","writable":true,"storage":"f32"},
+    {"id":"turret.yaw_speed","display_name":"Horizontal turn speed","type":"number","unit":"degrees_per_second","writable":true,"storage":"f32","component":"TurretComponentData","offset":12},
+    {"id":"turret.pitch_speed","display_name":"Vertical turn speed","type":"number","unit":"degrees_per_second","writable":true,"storage":"f32","component":"TurretComponentData","offset":8},
+    {"id":"turret.pitch_min","display_name":"Lowest aim angle","type":"number","unit":"degrees","writable":true,"storage":"f32","component":"TurretComponentData","offset":20},
+    {"id":"turret.pitch_max","display_name":"Highest aim angle","type":"number","unit":"degrees","writable":true,"storage":"f32","component":"TurretComponentData","offset":24},
+    {"id":"turret.yaw_min","display_name":"Left traverse limit","type":"number","unit":"degrees","writable":true,"storage":"f32","component":"TurretComponentData","offset":28,"reason":"Paired with the proven vertical limits and consistent with every turret's arc, but no table publishes it; requires allow_unverified_effect."},
+    {"id":"turret.yaw_max","display_name":"Right traverse limit","type":"number","unit":"degrees","writable":true,"storage":"f32","component":"TurretComponentData","offset":32,"reason":"Paired with the proven vertical limits and consistent with every turret's arc, but no table publishes it; requires allow_unverified_effect."},
+    {"id":"targeting.range","display_name":"Targeting range","type":"number","unit":"meters","writable":true,"storage":"f32","component":"SensorEyeComponentData","offset":0},
+    {"id":"minefield.salvos","display_name":"Mine salvos","type":"integer","unit":"count","writable":true,"storage":"u32","component":"ThrowerComponentData","offset":40},
+    {"id":"minefield.mines_per_salvo","display_name":"Mines per salvo","type":"integer","unit":"count","writable":true,"storage":"u32","component":"ThrowerComponentData","offset":44}
+  ]
+}

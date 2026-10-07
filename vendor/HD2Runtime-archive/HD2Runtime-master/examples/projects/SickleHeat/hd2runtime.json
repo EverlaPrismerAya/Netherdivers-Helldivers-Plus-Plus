@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "name": "SickleHeat",
+  "resource": "mods/hd2runtime_examples/sickle_heat",
+  "guid": "a1e7348d-8f94-52be-86bc-991ed8a43d4d",
+  "requires": {
+    "bingus": {
+      "min_release": 15,
+      "api": 1
+    },
+    "hd2runtime": {
+      "min_version": "0.23.2",
+      "api": 1,
+      "module": "mods/skyeshade/hd2runtime"
+    }
+  },
+  "sdk": "../../../sdk",
+  "ide_library": "../../../sdk/stubs"
+}

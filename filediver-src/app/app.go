@@ -1,0 +1,1024 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"golang.org/x/text/cases"
+	language_lib "golang.org/x/text/language"
+
+	"github.com/gobwas/glob"
+	"github.com/qmuntal/gltf"
+	"github.com/xypwn/filediver/app/appconfig"
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/datalibrary/enum"
+	"github.com/xypwn/filediver/dds"
+	"github.com/xypwn/filediver/exec"
+	"github.com/xypwn/filediver/extractor"
+	extr_ah_bin "github.com/xypwn/filediver/extractor/ah_bin"
+	extr_animation "github.com/xypwn/filediver/extractor/animation"
+	extr_bik "github.com/xypwn/filediver/extractor/bink"
+	extr_bones "github.com/xypwn/filediver/extractor/bones"
+	extr_entity "github.com/xypwn/filediver/extractor/entity"
+	extr_geogroup "github.com/xypwn/filediver/extractor/geometry_group"
+	extr_level "github.com/xypwn/filediver/extractor/level"
+	extr_material "github.com/xypwn/filediver/extractor/material"
+	extr_package "github.com/xypwn/filediver/extractor/package"
+	extr_prefab "github.com/xypwn/filediver/extractor/prefab"
+	extr_shading_environment "github.com/xypwn/filediver/extractor/shading_environment"
+	extr_speedtree "github.com/xypwn/filediver/extractor/speedtree"
+	extr_state_machine "github.com/xypwn/filediver/extractor/state_machine"
+	extr_strings "github.com/xypwn/filediver/extractor/strings"
+	extr_texture "github.com/xypwn/filediver/extractor/texture"
+	extr_ttf "github.com/xypwn/filediver/extractor/ttf"
+	extr_unit "github.com/xypwn/filediver/extractor/unit"
+	extr_wwise "github.com/xypwn/filediver/extractor/wwise"
+	extr_xaml "github.com/xypwn/filediver/extractor/xaml"
+	"github.com/xypwn/filediver/steampath"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/ah_bin"
+	stingray_package "github.com/xypwn/filediver/stingray/package"
+	"github.com/xypwn/filediver/stingray/shading_environment"
+	stingray_strings "github.com/xypwn/filediver/stingray/strings"
+	"github.com/xypwn/filediver/stingray/unit"
+	stingray_material "github.com/xypwn/filediver/stingray/unit/material"
+	stingray_wwise "github.com/xypwn/filediver/stingray/wwise"
+	"github.com/xypwn/filediver/util"
+	"github.com/xypwn/filediver/wwise"
+)
+
+func parseWwiseDep(dataDir *stingray.DataDir, fileID stingray.FileID) (string, error) {
+	var r *bytes.Reader
+	{
+		b, err := dataDir.Read(fileID, stingray.DataMain)
+		if err != nil {
+			return "", err
+		}
+		r = bytes.NewReader(b)
+	}
+	var magicNum [4]byte
+	if _, err := io.ReadFull(r, magicNum[:]); err != nil {
+		return "", err
+	}
+	validMagicNums := [][4]byte{
+		{0xd8, '/', 'v', 'x'},   // < patch 1.003.200
+		{0x85, 0xf1, 0xa3, 'x'}, // >= patch 1.003.200
+		{0xb1, 0xf2, 0xa3, 'x'}, // >= patch 1.410.000
+		{0xa5, 0xf4, 0xa3, 'x'}, // >= patch 1.006.200
+	}
+	if !slices.Contains(validMagicNums, magicNum) {
+		return "", fmt.Errorf("invalid magic number, got: %s", strconv.Quote(string(magicNum[:])))
+	}
+	var textLen uint32
+	if err := binary.Read(r, binary.LittleEndian, &textLen); err != nil {
+		return "", err
+	}
+	text := make([]byte, textLen-1)
+	if _, err := io.ReadFull(r, text); err != nil {
+		return "", err
+	}
+	return string(text), nil
+}
+
+// Returns error if steam path couldn't be found.
+func DetectGameDir() (string, error) {
+	return steampath.GetAppPath("553850", "Helldivers 2")
+}
+
+func VerifyGameDir(path string) error {
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		return fmt.Errorf("invalid game directory: %v: not a directory", path)
+	}
+	if info, err := os.Stat(filepath.Join(path, "settings.ini")); err == nil && info.Mode().IsRegular() {
+		// We were given the "data" directory => go back
+		path = filepath.Dir(path)
+	}
+	if info, err := os.Stat(filepath.Join(path, "data", "settings.ini")); err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("invalid game directory: %v: valid data directory not found", path)
+	}
+	return nil
+}
+
+type App struct {
+	Hashes             map[stingray.Hash]string
+	ThinHashes         map[stingray.ThinHash]string
+	ArmorSets          map[stingray.Hash]datalib.ArmorSet
+	SkinOverrideGroups []datalib.UnitSkinOverrideGroup
+	WeaponPaintSchemes []datalib.WeaponCustomizableItem
+	AttachmentSlots    map[stingray.Hash]enum.WeaponCustomizationSlot
+	EntityVarMapping   shading_environment.ShadingEnvironmentEntityToShaderMapping
+	Planets            map[string]datalib.PlanetData
+	PlanetOverrides    datalib.PlanetOverridesMap
+	PlanetRegionsMap   map[stingray.ThinHash]datalib.GenerationRegionVariantList
+	EnvironmentMap     map[enum.PlanetType]datalib.EnvironmentSettings
+	AssetOverrides     *map[stingray.FileID]stingray.FileID
+	DataDir            *stingray.DataDir
+	Language           stingray.ThinHash
+	LanguageMap        map[uint32]string
+	Metadata           map[stingray.FileID]FileMetadata
+	GameBuildInfo      *ah_bin.BuildInfo
+}
+
+func getLowerCaser(language stingray.ThinHash) cases.Caser {
+	languageTag, contains := stingray_strings.LanguageHashToLanguageTag[language]
+	if !contains {
+		languageTag = language_lib.English
+	}
+	return cases.Lower(languageTag)
+}
+
+// Automatically gets most wwise-related hashes by reading the game files
+func getWwiseHashes(dataDir *stingray.DataDir) (map[stingray.Hash]string, error) {
+	hashes := make(map[stingray.Hash]string)
+	// Read wwise_dep files to figure out the names of all wwise_bank files
+	for id := range dataDir.Files {
+		if id.Type == stingray.Sum("wwise_dep") {
+			h, err := parseWwiseDep(dataDir, id)
+			if err != nil {
+				return nil, fmt.Errorf("wwise_dep: %w", err)
+			}
+			hashes[stingray.Sum(h)] = h
+		}
+	}
+	// Read wwise_bank files to figure out the names of most wwise_stream files
+	for id := range dataDir.Files {
+		if id.Type == stingray.Sum("wwise_bank") {
+			name, ok := hashes[id.Name]
+			if !ok {
+				// It seems the wwise banks no longer all have an according wwise_dep (https://github.com/xypwn/filediver/issues/35).
+				// Hopefully these banks missing won't become a problem.
+				//return nil, fmt.Errorf("expected all wwise banks to have a known name, but cannot find name for hash %v", id.Name)
+				continue
+			}
+			dir := path.Dir(name)
+			if err := func() error {
+				b, err := dataDir.Read(id, stingray.DataMain)
+				if err != nil {
+					return err
+				}
+				bnk, err := stingray_wwise.OpenBnk(bytes.NewReader(b))
+				if err != nil {
+					return err
+				}
+				for i := 0; i < bnk.NumFiles(); i++ {
+					id := bnk.FileID(i)
+					streamPath := path.Join(dir, fmt.Sprint(id))
+					hashes[stingray.Sum(streamPath)] = streamPath
+				}
+				for _, obj := range bnk.HircObjects {
+					if obj.Header.Type == wwise.BnkHircObjectSound {
+						streamPath := path.Join(dir, fmt.Sprint(obj.Sound.SourceID))
+						hashes[stingray.Sum(streamPath)] = streamPath
+					}
+				}
+				return nil
+			}(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// 6 hashes were still missing when tested
+	/*// Validate that all wwise_stream file names are known
+	{
+		numWithoutName := 0
+		for id := range dataDir.Files {
+			if id.Type == stingray.Sum("wwise_stream") {
+				if _, ok := hashes[id.Name]; !ok {
+					fmt.Println(id.Name)
+					numWithoutName++
+				}
+			}
+		}
+		if numWithoutName > 0 {
+			return nil, fmt.Errorf("expected all wwise streams to have a known name, but cannot find name for %v hashes", numWithoutName)
+		}
+	}*/
+
+	return hashes, nil
+}
+
+func getFileMetadata(dataDir *stingray.DataDir) map[stingray.FileID]FileMetadata {
+	metadata := make(map[stingray.FileID]FileMetadata, len(dataDir.Files))
+	for fileID := range dataDir.Files {
+		meta := FileMetadata{
+			AvailableFields: make(map[string]bool),
+			Name:            fileID.Name,
+			Type:            fileID.Type,
+		}
+		for _, info := range dataDir.Files[fileID] {
+			meta.Archives = append(meta.Archives, info.ArchiveID)
+		}
+		meta.addAvailableFields("Name", "Type", "Archives")
+		switch fileID.Type {
+		case stingray.Sum("texture"):
+			const stingrayHeaderSize = 0xc0
+			const textureHeaderSize = stingrayHeaderSize + 0x04 /*DDS magic*/ + 0x7c /*DDS header*/ + 0x14 /*DXT10 header*/
+			b, err := dataDir.ReadAtMost(fileID, stingray.DataMain, textureHeaderSize)
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			bR := bytes.NewReader(b)
+			if _, err := bR.Seek(stingrayHeaderSize, io.SeekCurrent); err != nil {
+				// ignore for now
+				continue
+			}
+			info, err := dds.DecodeInfo(bR)
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			meta.Width = int(info.Header.Width)
+			meta.Height = int(info.Header.Height)
+			meta.Format = info.DXT10Header.DXGIFormat.String()
+			meta.addAvailableFields("Width", "Height", "Format")
+		case stingray.Sum("strings"):
+			b, err := dataDir.ReadAtMost(fileID, stingray.DataMain, 0x10)
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			hdr, err := stingray_strings.LoadHeader(bytes.NewReader(b))
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			meta.Language = hdr.Language
+			meta.addAvailableFields("Language")
+		case stingray.Sum("material"):
+			b, err := dataDir.Read(fileID, stingray.DataMain)
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			mat, err := stingray_material.LoadMain(bytes.NewReader(b))
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			slots := make([]stingray.ThinHash, 0)
+			textures := make([]stingray.Hash, 0)
+			if mat.Textures != nil {
+				slots = slices.Collect(maps.Keys(mat.Textures))
+				textures = slices.Collect(maps.Values(mat.Textures))
+			}
+			meta.BaseMaterial = mat.BaseMaterial
+			meta.TextureSlots = slots
+			meta.TextureNames = textures
+			meta.addAvailableFields("BaseMaterial")
+			meta.addAvailableFields("TextureSlots")
+			meta.addAvailableFields("TextureNames")
+		case stingray.Sum("unit"):
+			b, err := dataDir.Read(fileID, stingray.DataMain)
+			if err != nil {
+				// ignore for now
+				continue
+			}
+			unitInfo, err := unit.LoadInfo(bytes.NewReader(b))
+			if err != nil {
+				continue
+			}
+			meta.MeshMaterials = make([]stingray.Hash, 0)
+			meta.MaterialSlots = make([]stingray.ThinHash, 0)
+			for key, value := range unitInfo.Materials {
+				meta.MaterialSlots = append(meta.MaterialSlots, key)
+				meta.MeshMaterials = append(meta.MeshMaterials, value)
+			}
+			meta.addAvailableFields("MeshMaterials", "MaterialSlots")
+		}
+		metadata[fileID] = meta
+	}
+	return metadata
+}
+
+func LoadSkinOverrides(dataDir *stingray.DataDir, languageMap map[uint32]string) ([]datalib.UnitSkinOverrideGroup, error) {
+	var getResource datalib.GetResourceFunc = func(id stingray.FileID, typ stingray.DataType) (data []byte, exists bool, err error) {
+		fileInfo, ok := dataDir.Files[id]
+		if !ok || !fileInfo[0].Exists(typ) {
+			return nil, false, nil
+		}
+		exists = true
+		data, err = dataDir.Read(id, typ)
+		return
+	}
+
+	customizationSettings, err := datalib.ParseUnitCustomizationSettings(getResource, languageMap)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing unit customization settings: %v\n", err)
+	}
+
+	var hellpodIdx int = -1
+	var hellpodRackIdx int = -1
+	for i := range customizationSettings {
+		if customizationSettings[i].CollectionType == datalib.CollectionHellpod {
+			hellpodIdx = i
+		} else if customizationSettings[i].CollectionType == datalib.CollectionHellpodRack {
+			hellpodRackIdx = i
+		}
+	}
+	if hellpodIdx != -1 && hellpodRackIdx != -1 {
+		for i := range customizationSettings[hellpodRackIdx].Skins {
+			customizationSettings[hellpodRackIdx].Skins[i].Name = customizationSettings[hellpodIdx].Skins[i].Name
+			for j, ammoRack := range customizationSettings[hellpodRackIdx].Skins[i].Customization.MaterialsTexturesOverrides {
+				if ammoRack.MaterialID == stingray.Sum("m_ammo_rack").Thin() || ammoRack.MaterialID.Value == 0xefd45abb {
+					// Rattlesnake overrides the wrong material ids, fix it so they use the correct ones
+					customizationSettings[hellpodRackIdx].Skins[i].Customization.MaterialsTexturesOverrides[j].MaterialID = stingray.Sum("m_rack").Thin()
+				}
+			}
+		}
+	}
+
+	skinOverrideGroups := make([]datalib.UnitSkinOverrideGroup, 0)
+	for _, setting := range customizationSettings {
+		skinOverrideGroups = append(skinOverrideGroups, setting.GetSkinOverrideGroup())
+	}
+
+	return skinOverrideGroups, nil
+}
+
+func LoadPaintSchemes(dataDir *stingray.DataDir, languageMap map[uint32]string) ([]datalib.WeaponCustomizableItem, error) {
+	var getResource datalib.GetResourceFunc = func(id stingray.FileID, typ stingray.DataType) (data []byte, exists bool, err error) {
+		fileInfo, ok := dataDir.Files[id]
+		if !ok || !fileInfo[0].Exists(typ) {
+			return nil, false, nil
+		}
+		exists = true
+		data, err = dataDir.Read(id, typ)
+		return
+
+	}
+
+	weaponCustomizations, err := datalib.ParseWeaponCustomizationSettings(getResource, languageMap)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing weapon customization settings: %v", err)
+	}
+
+	for _, customization := range weaponCustomizations {
+		if len(customization.Items) == 0 || len(customization.Items[0].Slots) == 0 {
+			continue
+		}
+		if customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_PaintScheme {
+			return customization.Items, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not find any weapon customization settings?")
+}
+
+func LoadAttachmentSlots(dataDir *stingray.DataDir, languageMap map[uint32]string, lookupHash datalib.HashLookup) (map[stingray.Hash]enum.WeaponCustomizationSlot, error) {
+	var getResource datalib.GetResourceFunc = func(id stingray.FileID, typ stingray.DataType) (data []byte, exists bool, err error) {
+		fileInfo, ok := dataDir.Files[id]
+		if !ok || !fileInfo[0].Exists(typ) {
+			return nil, false, nil
+		}
+		exists = true
+		data, err = dataDir.Read(id, typ)
+		return
+
+	}
+
+	weaponCustomizations, err := datalib.ParseWeaponCustomizationSettings(getResource, languageMap)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing weapon customization settings: %v", err)
+	}
+
+	result := make(map[stingray.Hash]enum.WeaponCustomizationSlot)
+	for _, customization := range weaponCustomizations {
+		if len(customization.Items) == 0 || len(customization.Items[0].Slots) == 0 {
+			continue
+		}
+		if customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_AmmoType ||
+			customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_AmmoTypeAlternate ||
+			customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_Internals ||
+			customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_Triggers ||
+			customization.Items[0].Slots[0] == enum.WeaponCustomizationSlot_PaintScheme {
+			// These slots don't have units that will be overwritten
+			continue
+		}
+		for _, item := range customization.Items {
+			if item.AddPath.Value == 0x0 || item.Archive.Value == 0x0 {
+				continue
+			}
+			_, ok := dataDir.Files[stingray.NewFileID(item.AddPath, stingray.Sum("unit"))]
+			// Some items in the settings just use the unit path as the add path, others are indirect and use the package
+			unitHashes := []stingray.Hash{item.AddPath}
+			if !ok {
+				archiveData, exists, err := getResource(stingray.NewFileID(item.Archive, stingray.Sum("package")), stingray.DataMain)
+				if !exists || err != nil {
+					return nil, fmt.Errorf("failed to load package file %v: %v", lookupHash(item.Archive), err)
+				}
+				archive, err := stingray_package.LoadPackage(bytes.NewReader(archiveData))
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse package file %v: %v", lookupHash(item.Archive), err)
+				}
+				clear(unitHashes)
+				for _, item := range archive.Items {
+					if item.Type == stingray.Sum("unit") {
+						unitHashes = append(unitHashes, item.Name)
+					}
+				}
+			}
+			//fmt.Printf("Adding %v: %v to attachment slots\n", lookupHash(unitHash), item.Slots[0].String())
+
+			if len(unitHashes) == 0 {
+				return nil, fmt.Errorf("expected each attachment to have at least some unit hash: %v", item.AddPath.String())
+			}
+
+			for _, unitHash := range unitHashes {
+				if _, contains := result[unitHash]; contains {
+					continue
+					//return nil, fmt.Errorf("expected each attachment to appear only once in weapon customization settings: %v", item.AddPath.String())
+				}
+				// smg underbarrel flamerthrower canister doesn't have its own weapon customization setting, so we have to set it manually
+				if unitHash == stingray.Sum("content/fac_helldivers/equipment/attachment/magazine/smg_flamer_cannister") {
+					result[unitHash] = enum.WeaponCustomizationSlot_Magazine
+					continue
+				}
+				result[unitHash] = item.Slots[0]
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func LoadEntityVariableMappings(dataDir *stingray.DataDir) (entityVarMapping shading_environment.ShadingEnvironmentEntityToShaderMapping) {
+	shadingEnvironmentMappings, err := shading_environment.LoadMappingsFromDataDir(dataDir)
+	if err == nil {
+		entityVarMapping = make(shading_environment.ShadingEnvironmentEntityToShaderMapping)
+		for _, mapping := range shadingEnvironmentMappings {
+			maps.Copy(entityVarMapping, mapping.ToEntityMap())
+		}
+	}
+	return
+}
+
+// Open game dir and read metadata.
+func OpenGameDir(ctx context.Context, gameDir string, hashStrings []string, thinhashes []string, language stingray.ThinHash, onProgress func(curr, total int)) (*App, error) {
+	dataDir, err := stingray.OpenDataDir(ctx, filepath.Join(gameDir, "data"), onProgress)
+	if err != nil {
+		return nil, err
+	}
+
+	hashesMap := make(map[stingray.Hash]string)
+	if wwiseHashes, err := getWwiseHashes(dataDir); err == nil {
+		for h, n := range wwiseHashes {
+			hashesMap[h] = n
+		}
+	} else {
+		return nil, err
+	}
+	for _, h := range hashStrings {
+		hashesMap[stingray.Sum(h)] = h
+	}
+	thinHashesMap := make(map[stingray.ThinHash]string)
+	for _, h := range thinhashes {
+		thinHashesMap[stingray.Sum(h).Thin()] = h
+	}
+
+	mapping := stingray_strings.LoadLanguageMap(dataDir, language)
+
+	buildInfo, err := ah_bin.LoadFromDataDir(dataDir)
+	if err != nil && err != ah_bin.NotFound {
+		return nil, fmt.Errorf("error loading game build info: %v", err)
+	}
+
+	lookupHash := func(hash stingray.Hash) string {
+		if name, ok := hashesMap[hash]; ok {
+			return name
+		}
+		return hash.String()
+	}
+
+	lookupThinHash := func(hash stingray.ThinHash) string {
+		if name, ok := thinHashesMap[hash]; ok {
+			return name
+		}
+		return hash.String()
+	}
+
+	lookupString := func(stringId uint32) string {
+		if stringId == 0 {
+			return ""
+		}
+		if name, ok := mapping[stringId]; ok {
+			return name
+		}
+		return strconv.FormatUint(uint64(stringId), 10)
+	}
+
+	passives, err := datalib.LoadPassiveBonusDefinitions(lookupHash, lookupThinHash, lookupString)
+
+	armorSets, err := datalib.LoadArmorSetDefinitions(mapping, passives)
+	if err != nil {
+		return nil, fmt.Errorf("error loading armor set definitions: %v", err)
+	}
+
+	skinOverrideGroups, err := LoadSkinOverrides(dataDir, mapping)
+	if err != nil {
+		return nil, fmt.Errorf("error loading skin overrides: %v", err)
+	}
+
+	weaponPaintSchemes, err := LoadPaintSchemes(dataDir, mapping)
+	if err != nil {
+		return nil, fmt.Errorf("error loading weapon paint schemes: %v", err)
+	}
+	attachmentSlots, err := LoadAttachmentSlots(dataDir, mapping, lookupHash)
+	if err != nil {
+		return nil, fmt.Errorf("error loading weapon attachment slots: %v", err)
+	}
+
+	entityVarMapping := LoadEntityVariableMappings(dataDir)
+
+	planetData, err := datalib.LoadPlanetData(lookupHash, lookupThinHash, lookupString)
+	if err != nil {
+		return nil, fmt.Errorf("error loading planet data: %v", err)
+	}
+	planetMap := make(map[string]datalib.PlanetData)
+	caser := getLowerCaser(language)
+	for _, planet := range planetData {
+		if planet.PlanetNameLoc == "" {
+			continue
+		}
+		planetNameLower := caser.String(planet.PlanetNameLoc)
+		planetMap[planetNameLower] = planet
+	}
+	planetOverrides, err := datalib.LoadPlanetOverrideSettings(lookupHash, lookupThinHash, lookupString)
+	if err != nil {
+		return nil, fmt.Errorf("error loading planet overrides data: %v", err)
+	}
+	planetOverridesMap := make(datalib.PlanetOverridesMap)
+	for _, override := range planetOverrides {
+		maps.Copy(planetOverridesMap, override.ToMap())
+	}
+
+	environmentSettings, err := datalib.LoadEnvironmentSettings()
+	if err != nil {
+		return nil, fmt.Errorf("error loading planet overrides data: %v", err)
+	}
+	environmentMap := make(map[enum.PlanetType]datalib.EnvironmentSettings)
+	for _, setting := range environmentSettings {
+		environmentMap[setting.PlanetType] = setting
+	}
+
+	planetRegionMappings := make(map[stingray.ThinHash]datalib.GenerationRegionVariantList)
+	regionGroups, err := datalib.LoadRegionGroups(lookupHash, lookupThinHash, lookupString)
+	if err == nil {
+		for _, group := range regionGroups {
+			maps.Copy(planetRegionMappings, group.RegionsMap())
+		}
+	}
+
+	var assetOverrides map[stingray.FileID]stingray.FileID
+
+	return &App{
+		Hashes:             hashesMap,
+		ThinHashes:         thinHashesMap,
+		ArmorSets:          armorSets,
+		SkinOverrideGroups: skinOverrideGroups,
+		WeaponPaintSchemes: weaponPaintSchemes,
+		AttachmentSlots:    attachmentSlots,
+		EntityVarMapping:   entityVarMapping,
+		Planets:            planetMap,
+		PlanetOverrides:    planetOverridesMap,
+		PlanetRegionsMap:   planetRegionMappings,
+		EnvironmentMap:     environmentMap,
+		AssetOverrides:     &assetOverrides,
+		DataDir:            dataDir,
+		Language:           language,
+		LanguageMap:        mapping,
+		Metadata:           getFileMetadata(dataDir),
+		GameBuildInfo:      buildInfo,
+	}, nil
+}
+
+func (a *App) hashNameVariationsForMatch(h stingray.Hash) []string {
+	res := []string{
+		h.StringEndian(binary.LittleEndian),
+		h.StringEndian(binary.BigEndian),
+		"0x" + h.StringEndian(binary.BigEndian),
+		"0x" + strings.TrimLeft(h.StringEndian(binary.BigEndian), "0"),
+		strings.ToUpper(h.StringEndian(binary.LittleEndian)),
+		strings.ToUpper(h.StringEndian(binary.BigEndian)),
+		"0x" + strings.ToUpper(h.StringEndian(binary.BigEndian)),
+		"0x" + strings.ToUpper(strings.TrimLeft(h.StringEndian(binary.BigEndian), "0")),
+	}
+	if name, ok := a.Hashes[h]; ok {
+		res = append(res, name)
+	}
+	return res
+}
+
+func (a *App) matchFileID(id stingray.FileID, glb glob.Glob, nameOnly bool) bool {
+	nameVariations := a.hashNameVariationsForMatch(id.Name)
+
+	var typeVariations []string
+	if !nameOnly {
+		typeVariations = a.hashNameVariationsForMatch(id.Type)
+	}
+
+	for _, name := range nameVariations {
+		if nameOnly {
+			if glb.Match(name) {
+				return true
+			}
+		} else {
+			for _, typ := range typeVariations {
+				if glb.Match(name + "." + typ) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func (a *App) MatchingFiles(
+	includeGlob string,
+	excludeGlob string,
+	includeOnlyTypes []string,
+	includeArchiveIDs []stingray.Hash,
+	metadataFilter string,
+	infof func(format string, args ...any),
+) (
+	map[stingray.FileID]struct{},
+	error,
+) {
+	var inclGlob glob.Glob
+	inclGlobNameOnly := !strings.Contains(includeGlob, ".")
+	if includeGlob != "" {
+		var err error
+		inclGlob, err = glob.Compile(includeGlob)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var exclGlob glob.Glob
+	exclGlobNameOnly := !strings.Contains(excludeGlob, ".")
+	if excludeGlob != "" {
+		var err error
+		exclGlob, err = glob.Compile(excludeGlob)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var metadataFilterProg *FilterExprProgram
+	if metadataFilter != "" {
+		var err error
+		metadataFilterProg, err = CompileMetadataFilterExpr(metadataFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var includeArchiveFiles map[stingray.FileID]struct{} = make(map[stingray.FileID]struct{})
+	for _, includeArchiveID := range includeArchiveIDs {
+		files, ok := a.DataDir.Archives[includeArchiveID]
+		if !ok {
+			return nil, fmt.Errorf("archive %v does not exist", includeArchiveID.String())
+		}
+		for _, f := range files {
+			includeArchiveFiles[f] = struct{}{}
+		}
+		if _, contains := a.ArmorSets[includeArchiveID]; !contains {
+			continue
+		}
+		if a.ArmorSets[includeArchiveID].Type == datalib.KitCape {
+			typeVariations := a.hashNameVariationsForMatch(stingray.Sum("unit"))
+			if len(includeOnlyTypes) == 0 || slices.ContainsFunc(includeOnlyTypes, func(includedType string) bool {
+				return slices.Contains(typeVariations, includedType)
+			}) {
+				infof("Archive of cape '%v' detected, adding cape units to export", util.PrettyTitleCase(a.ArmorSets[includeArchiveID].Name))
+				includeArchiveFiles[stingray.NewFileID(stingray.Sum("content/fac_helldivers/capes/medium_cape"), stingray.Sum("unit"))] = struct{}{}
+				includeArchiveFiles[stingray.NewFileID(stingray.Sum("content/fac_helldivers/capes/shock_trooper_cape"), stingray.Sum("unit"))] = struct{}{}
+			}
+		}
+	}
+
+	res := make(map[stingray.FileID]struct{})
+	for id := range a.DataDir.Files {
+		shouldIncl := true
+		if len(includeArchiveIDs) != 0 {
+			if _, ok := includeArchiveFiles[id]; !ok {
+				shouldIncl = false
+			}
+		}
+		if len(includeOnlyTypes) != 0 {
+			typeVariations := a.hashNameVariationsForMatch(id.Type)
+			if slices.ContainsFunc(includeOnlyTypes, func(includedType string) bool {
+				return !slices.Contains(typeVariations, includedType)
+			}) {
+				continue
+			}
+		}
+		if includeGlob != "" {
+			// Include all files in archive even if they don't match the includeGlob - includeGlob will only add files to read
+			shouldIncl = (len(includeArchiveIDs) != 0 && shouldIncl) || a.matchFileID(id, inclGlob, inclGlobNameOnly)
+		}
+		if excludeGlob != "" {
+			if a.matchFileID(id, exclGlob, exclGlobNameOnly) {
+				shouldIncl = false
+			}
+		}
+		if metadataFilterProg != nil && shouldIncl {
+			matches, err := MetadataFilterExprMatches(metadataFilterProg, a.Metadata[id])
+			if err != nil {
+				return nil, err
+			}
+			if !matches {
+				shouldIncl = false
+			}
+		}
+		if !shouldIncl {
+			continue
+		}
+
+		res[id] = struct{}{}
+	}
+
+	return res, nil
+}
+
+// Prints hash if human-readable name is unknown.
+func (a *App) LookupHash(hash stingray.Hash) string {
+	if name, ok := a.Hashes[hash]; ok {
+		return name
+	}
+	return hash.String()
+}
+
+// Prints hash if human-readable name is unknown.
+func (a *App) LookupThinHash(hash stingray.ThinHash) string {
+	if name, ok := a.ThinHashes[hash]; ok {
+		return name
+	}
+	return hash.String()
+}
+
+// Prints string if string id is known.
+func (a *App) LookupString(stringId uint32) string {
+	if name, ok := a.LanguageMap[stringId]; ok {
+		return name
+	}
+	if stringId == 0 {
+		return ""
+	}
+	return strconv.FormatUint(uint64(stringId), 10)
+}
+
+func (a *App) GetPlanet(planetName string, city bool) *datalib.PlanetData {
+	caser := getLowerCaser(a.Language)
+	planetName = caser.String(planetName)
+	var planet datalib.PlanetData
+	var contains bool
+	if planet, contains = a.Planets[planetName]; !contains {
+		return nil
+	}
+	return &planet
+}
+
+func (a *App) GetAssetOverrides(planetName string, city bool) map[stingray.FileID]stingray.FileID {
+	planet := a.GetPlanet(planetName, city)
+	if planet == nil {
+		return nil
+	}
+	assetOverrides := make(map[stingray.FileID]stingray.FileID)
+	for _, region := range planet.ResourceRegionOverrides {
+		if !city && region.RegionFlag == enum.RegionFlag_City {
+			continue
+		}
+		regionOverrides, contains := a.PlanetOverrides[region.ID]
+		if !contains {
+			continue
+		}
+		maps.Copy(assetOverrides, regionOverrides)
+	}
+	return assetOverrides
+}
+
+func (a *App) UpdateAssetOverrides(planetName string, city bool) {
+	assetOverrides := a.GetAssetOverrides(planetName, city)
+	*a.AssetOverrides = assetOverrides
+}
+
+func getSourceExtractFunc(extrCfg appconfig.Config, typ string) (extr extractor.ExtractFunc) {
+	switch extrCfg.Raw.Format {
+	case "main":
+		extr = extractor.ExtractFuncRawSingleType(typ, stingray.DataMain)
+	case "stream":
+		extr = extractor.ExtractFuncRawSingleType(typ, stingray.DataStream)
+	case "gpu":
+		extr = extractor.ExtractFuncRawSingleType(typ, stingray.DataGPU)
+	case "combined":
+		extr = extractor.ExtractFuncRawCombined(typ)
+	default:
+		extr = extractor.ExtractFuncRaw(typ)
+	}
+	return
+}
+
+// Returns path to extracted file/directory.
+func (a *App) ExtractFile(ctx context.Context, id stingray.FileID, outDir string, extrCfg appconfig.Config, runner *exec.Runner, gltfDoc *gltf.Document, archiveIDs []stingray.Hash, printer Printer, statusf func(format string, args ...any)) ([]string, error) {
+	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) {
+		return nil, ctxErr
+	}
+
+	name, typ := a.LookupHash(id.Name), a.LookupHash(id.Type)
+
+	typeFormats := appconfig.GetTypeFormats(extrCfg)
+	extrFormat := typeFormats[typ]
+
+	var extr extractor.ExtractFunc
+	if extrFormat == "raw" {
+		extr = getSourceExtractFunc(extrCfg, typ)
+	} else {
+		switch typ {
+		case "animation":
+			extr = extr_animation.ExtractAnimationJson
+		case "bik", "bk2":
+			if extrFormat == "bik" || extrFormat == "bk2" {
+				extr = extr_bik.ExtractBink(typ)
+			} else {
+				extr = extr_bik.ConvertBinkToMP4(typ)
+			}
+		case "wwise_stream":
+			if extrFormat == "wwise" {
+				extr = extr_wwise.ExtractWem
+			} else {
+				extr = extr_wwise.ConvertWem
+			}
+		case "wwise_bank":
+			if extrFormat == "wwise" {
+				extr = extr_wwise.ExtractBnk
+			} else {
+				extr = extr_wwise.ConvertBnk
+			}
+		case "material":
+			if extrFormat == "folder" {
+				extr = extr_material.ConvertToFolder
+			} else {
+				extr = extr_material.Convert(gltfDoc)
+			}
+		case "unit":
+			extr = extr_unit.Convert(gltfDoc)
+		case "geometry_group":
+			extr = extr_geogroup.Convert(gltfDoc)
+		case "prefab":
+			if extrFormat == "model" && typeFormats["unit"] == "raw" {
+				extr = getSourceExtractFunc(extrCfg, typ)
+			} else {
+				extr = extr_prefab.Convert(gltfDoc)
+			}
+		case "level":
+			if extrFormat == "model" && typeFormats["unit"] == "raw" {
+				extr = getSourceExtractFunc(extrCfg, typ)
+			} else {
+				extr = extr_level.Convert(gltfDoc)
+			}
+		case "speedtree":
+			if extrFormat == "model" && typeFormats["unit"] == "raw" {
+				extr = getSourceExtractFunc(extrCfg, typ)
+			} else {
+				extr = extr_speedtree.Convert(gltfDoc)
+			}
+		case "texture":
+			if extrFormat == "dds" {
+				extr = extr_texture.ExtractDDS
+			} else {
+				extr = extr_texture.ConvertToPNG
+			}
+		case "state_machine":
+			extr = extr_state_machine.ExtractStateMachineJson
+		case "strings":
+			extr = extr_strings.ExtractStringsJSON
+		case "package":
+			extr = extr_package.ExtractPackageJSON
+		case "bones":
+			extr = extr_bones.ExtractBonesJSON
+		case "ah_bin":
+			extr = extr_ah_bin.ExtractAhBinJSON
+		case "entity":
+			extr = extr_entity.ExtractEntityJSON
+		case "shading_environment":
+			extr = extr_shading_environment.ExtractShadingEnvironmentJSON
+		case "shading_environment_mapping":
+			extr = extr_shading_environment.ExtractShadingEnvironmentMappingJSON
+		case "xaml":
+			if extrFormat == "svg" {
+				extr = extr_xaml.ExtractSVG
+			} else {
+				extr = extr_xaml.ExtractXAML
+			}
+		case "ttf":
+			extr = extr_ttf.ExtractTTF
+		case "otf":
+			extr = extr_ttf.ExtractOTF
+		default:
+			extr = getSourceExtractFunc(extrCfg, typ)
+		}
+	}
+
+	outPath := filepath.Join(outDir, name)
+	if err := os.MkdirAll(filepath.Dir(outPath), os.ModePerm); err != nil {
+		return nil, err
+	}
+	extrCtx, getOutFiles := extractor.NewContext(
+		ctx,
+		id,
+		a.Hashes,
+		a.ThinHashes,
+		a.ArmorSets,
+		a.SkinOverrideGroups,
+		a.WeaponPaintSchemes,
+		a.AttachmentSlots,
+		a.EntityVarMapping,
+		a.Planets,
+		a.PlanetRegionsMap,
+		a.EnvironmentMap,
+		a.GameBuildInfo,
+		a.LanguageMap,
+		a.DataDir,
+		runner,
+		extrCfg,
+		outPath,
+		archiveIDs,
+		func(format string, args ...any) {
+			name, typ := a.LookupHash(id.Name), a.LookupHash(id.Type)
+			printer.Warnf("extract %v.%v: %v", name, typ, fmt.Sprintf(format, args...))
+		},
+		statusf,
+	)
+
+	caser := getLowerCaser(a.Language)
+	planetName := caser.String(extrCfg.Planet.Name)
+	if planet, contains := a.Planets[planetName]; contains {
+		a.UpdateAssetOverrides(planetName, extrCfg.Planet.City)
+		extrCtx = extrCtx.WithAssetOverrides(*a.AssetOverrides).WithColorGrading(planet.PaletteGroupLowland.AssetGrading)
+	}
+
+	extrCtx = (func() *extractor.Context {
+		if !extrCfg.Unit.EntityOverrideDefault {
+			return extrCtx
+		}
+		if extrCfg.Unit.EntityName == "" {
+			return extrCtx
+		}
+		entityHash, err := stingray.ParseOrSum(extrCfg.Unit.EntityName)
+		if err != nil {
+			return extrCtx
+		}
+
+		materialSwapData, err := datalib.GetMaterialSwapComponentDataForHash(entityHash)
+		if err != nil {
+			return extrCtx
+		}
+
+		var materialSwap datalib.MaterialSwapComponent
+		if _, err := binary.Decode(materialSwapData, binary.LittleEndian, &materialSwap); err != nil {
+			return extrCtx
+		}
+
+		materialOverrides := make(map[stingray.ThinHash]stingray.Hash)
+		for _, materialSlot := range materialSwap.MaterialSlots {
+			if materialSlot.MaterialSlotName.Value == 0x0 {
+				continue
+			}
+			materialOverrides[materialSlot.MaterialSlotName] = materialSlot.SwapSettings[0].Material
+		}
+
+		return extrCtx.WithMaterialOverrides(materialOverrides)
+	})()
+
+	err := extr(extrCtx)
+	outFiles := getOutFiles()
+	if err != nil {
+		{
+			var err error
+			var errPath string
+			for _, path := range outFiles {
+				if e := os.Remove(path); e != nil && !errors.Is(e, os.ErrNotExist) && err == nil {
+					err = e
+					errPath = path
+				}
+			}
+			if err != nil {
+				return nil, fmt.Errorf("cleanup %v: %w", errPath, err)
+			}
+		}
+		return nil, fmt.Errorf("extract %v.%v: %w", name, typ, err)
+	}
+
+	return outFiles, nil
+}

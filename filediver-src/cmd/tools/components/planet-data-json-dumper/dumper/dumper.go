@@ -1,0 +1,176 @@
+package dumper
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/xypwn/filediver/cmd/tools/components"
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/datalibrary/enum"
+)
+
+type SimpleResourceRegionOverride struct {
+	ID         string          `json:"id"`
+	RegionFlag enum.RegionFlag `json:"region_flag"`
+}
+
+type SimpleResourceOverride struct {
+	Type        string `json:"type"`
+	Replace     string `json:"replace"`
+	ReplaceWith string `json:"replace_with"`
+}
+
+type SimpleLevelGenerationPaletteGroup struct {
+	//Palette                 string                  `json:"palette"`
+	AssetGrading            string                  `json:"asset_grading"`
+	SkySettingsGroup        string                  `json:"sky_settings_group"`
+	DayGrading              string                  `json:"day_grading"`
+	NightGrading            string                  `json:"night_grading"`
+	SunsetGrading           string                  `json:"sunset_grading"`
+	WeatherColorSet         string                  `json:"weather_color_set"`
+	WeatherColorSetInternal datalib.WeatherColorSet `json:"weather_color_set_internal"`
+}
+
+type SimplePlanetData struct {
+	Inherits                         string                              `json:"inherits"`
+	PlanetNameLoc                    string                              `json:"planet_name_loc"`
+	PlanetDescriptionLoc             string                              `json:"planet_description_loc"`
+	PlanetDescriptionShortLoc        string                              `json:"planet_description_short_loc"`
+	PlanetSystemNameLoc              string                              `json:"planet_system_name_loc"`
+	PlanetLayoutId                   string                              `json:"planet_layout_id"`
+	MaterialLookupUnit1              string                              `json:"material_lookup_unit1"`
+	MaterialLookupUnit2              string                              `json:"material_lookup_unit2"`
+	MaterialLookupUnit3              string                              `json:"material_lookup_unit3"`
+	ResourceOverrides                []SimpleResourceOverride            `json:"resource_overrides"`
+	DebugName                        string                              `json:"debug_name"`
+	RegionLowland                    datalib.SimpleLevelGenerationRegion `json:"region_lowland"`
+	RegionHighland                   datalib.SimpleLevelGenerationRegion `json:"region_highland"`
+	PaletteGroupLowland              SimpleLevelGenerationPaletteGroup   `json:"palette_group_lowland"`
+	PaletteGroupHighland             SimpleLevelGenerationPaletteGroup   `json:"palette_group_highland"`
+	ScenarioSettingsLowland          string                              `json:"scenario_settings_lowland"`
+	ScenarioSettingsHighland         string                              `json:"scenario_settings_highland"`
+	GameplayModifiers                []string                            `json:"gameplay_modifiers"`
+	PlanetType                       enum.PlanetType                     `json:"planet_type"`
+	Unknown                          string                              `json:"unknown"`
+	NatureLocationTags               []enum.NatureLocationTag            `json:"nature_location_tags"`
+	ScatterSettings                  string                              `json:"scatter_settings"`
+	MissionPlanetUnit                string                              `json:"mission_planet_unit"`
+	MissionPlanetHologramUnit        string                              `json:"mission_planet_hologram_unit"`
+	MissionPlanetUnitPackage         string                              `json:"mission_planet_unit_package"`
+	MissionPlanetHologramUnitPackage string                              `json:"mission_planet_hologram_unit_package"`
+	SolarSystemSettings              string                              `json:"solar_system_settings"`
+	SolarSystemIdSelections          []string                            `json:"solar_system_id_selections"`
+	SampleTypes                      []enum.SampleType                   `json:"sample_types"`
+	AmbienceSoundIdStart             uint32                              `json:"ambience_sound_id_start"`
+	AmbienceSoundIdStop              uint32                              `json:"ambience_sound_id_stop"`
+	HologramPlanetMaterial           string                              `json:"hologram_planet_material"`
+	PlanetPreviewImage               string                              `json:"planet_preview_image"`
+	ResourceRegionOverrides          []SimpleResourceRegionOverride      `json:"resource_region_overrides"`
+	ShadingEnvironmentEntity         string                              `json:"shading_environment_entity"`
+	WaterEntity                      string                              `json:"water_entity"`
+	HeathazeEntity                   string                              `json:"heathaze_entity"`
+	PackagePath                      string                              `json:"package_path"`
+	UnknownFloat                     float32                             `json:"unknown_float"`
+}
+
+func Dump(a components.HashLookup) {
+	planetDataArray, err := datalib.LoadPlanetData(a.LookupHash, a.LookupThinHash, a.LookupString)
+	if err != nil {
+		panic(err)
+	}
+
+	simplePlanetDataArray := make([]SimplePlanetData, 0)
+
+	for _, planetData := range planetDataArray {
+		gameplayModifiers := make([]string, 0)
+		for _, modifier := range planetData.GameplayModifiers {
+			gameplayModifiers = append(gameplayModifiers, a.LookupHash(modifier))
+		}
+		solarSystemIdSelections := make([]string, 0)
+		for _, solarSystem := range planetData.SolarSystemIdSelections {
+			solarSystemIdSelections = append(solarSystemIdSelections, a.LookupHash(solarSystem))
+		}
+		resourceRegionOverrides := make([]SimpleResourceRegionOverride, 0)
+		for _, override := range planetData.ResourceRegionOverrides {
+			resourceRegionOverrides = append(resourceRegionOverrides, SimpleResourceRegionOverride{
+				ID:         a.LookupThinHash(override.ID),
+				RegionFlag: override.RegionFlag,
+			})
+		}
+		resourceOverrides := make([]SimpleResourceOverride, 0)
+		for _, override := range planetData.ResourceOverrides {
+			resourceOverrides = append(resourceOverrides, SimpleResourceOverride{
+				Type:        a.LookupHash(override.Type),
+				Replace:     a.LookupHash(override.Replace),
+				ReplaceWith: a.LookupHash(override.ReplaceWith),
+			})
+		}
+		simplePlanetData := SimplePlanetData{
+			Inherits:                  planetData.Inherits,
+			PlanetNameLoc:             planetData.PlanetNameLoc,
+			PlanetDescriptionLoc:      planetData.PlanetDescriptionLoc,
+			PlanetDescriptionShortLoc: planetData.PlanetDescriptionShortLoc,
+			PlanetSystemNameLoc:       planetData.PlanetSystemNameLoc,
+			PlanetLayoutId:            a.LookupThinHash(planetData.PlanetLayoutId),
+			MaterialLookupUnit1:       a.LookupHash(planetData.MaterialLookupUnit1),
+			MaterialLookupUnit2:       a.LookupHash(planetData.MaterialLookupUnit2),
+			MaterialLookupUnit3:       a.LookupHash(planetData.MaterialLookupUnit3),
+			ResourceOverrides:         resourceOverrides,
+			DebugName:                 planetData.DebugName,
+			RegionLowland:             planetData.RegionLowland.ToSimple(a.LookupHash, a.LookupThinHash, a.LookupString),
+			RegionHighland:            planetData.RegionHighland.ToSimple(a.LookupHash, a.LookupThinHash, a.LookupString),
+
+			PaletteGroupLowland: SimpleLevelGenerationPaletteGroup{
+				//Palette:                 a.LookupHash(planetData.PaletteGroupLowland.Palette),
+				AssetGrading:            a.LookupHash(planetData.PaletteGroupLowland.AssetGrading),
+				SkySettingsGroup:        a.LookupHash(planetData.PaletteGroupLowland.SkySettingsGroup),
+				DayGrading:              a.LookupHash(planetData.PaletteGroupLowland.DayGrading),
+				NightGrading:            a.LookupHash(planetData.PaletteGroupLowland.NightGrading),
+				SunsetGrading:           a.LookupHash(planetData.PaletteGroupLowland.SunsetGrading),
+				WeatherColorSet:         a.LookupThinHash(planetData.PaletteGroupLowland.WeatherColorSet),
+				WeatherColorSetInternal: planetData.PaletteGroupLowland.WeatherColorSetInternal,
+			},
+			PaletteGroupHighland: SimpleLevelGenerationPaletteGroup{
+				//Palette:                 a.LookupHash(planetData.PaletteGroupHighland.Palette),
+				AssetGrading:            a.LookupHash(planetData.PaletteGroupHighland.AssetGrading),
+				SkySettingsGroup:        a.LookupHash(planetData.PaletteGroupHighland.SkySettingsGroup),
+				DayGrading:              a.LookupHash(planetData.PaletteGroupHighland.DayGrading),
+				NightGrading:            a.LookupHash(planetData.PaletteGroupHighland.NightGrading),
+				SunsetGrading:           a.LookupHash(planetData.PaletteGroupHighland.SunsetGrading),
+				WeatherColorSet:         a.LookupThinHash(planetData.PaletteGroupHighland.WeatherColorSet),
+				WeatherColorSetInternal: planetData.PaletteGroupHighland.WeatherColorSetInternal,
+			},
+			ScenarioSettingsLowland:          a.LookupHash(planetData.ScenarioSettingsLowland),
+			ScenarioSettingsHighland:         a.LookupHash(planetData.ScenarioSettingsHighland),
+			GameplayModifiers:                gameplayModifiers,
+			PlanetType:                       planetData.PlanetType,
+			Unknown:                          a.LookupThinHash(planetData.Unknown),
+			NatureLocationTags:               planetData.NatureLocationTags,
+			ScatterSettings:                  a.LookupThinHash(planetData.ScatterSettings),
+			MissionPlanetUnit:                a.LookupHash(planetData.MissionPlanetUnit),
+			MissionPlanetHologramUnit:        a.LookupHash(planetData.MissionPlanetHologramUnit),
+			MissionPlanetUnitPackage:         a.LookupHash(planetData.MissionPlanetUnitPackage),
+			MissionPlanetHologramUnitPackage: a.LookupHash(planetData.MissionPlanetHologramUnitPackage),
+			SolarSystemSettings:              a.LookupHash(planetData.SolarSystemSettings),
+			SolarSystemIdSelections:          solarSystemIdSelections,
+			SampleTypes:                      planetData.SampleTypes,
+			AmbienceSoundIdStart:             planetData.AmbienceSoundIdStart,
+			AmbienceSoundIdStop:              planetData.AmbienceSoundIdStop,
+			HologramPlanetMaterial:           a.LookupHash(planetData.HologramPlanetMaterial),
+			PlanetPreviewImage:               a.LookupHash(planetData.PlanetPreviewImage),
+			ResourceRegionOverrides:          resourceRegionOverrides,
+			ShadingEnvironmentEntity:         a.LookupHash(planetData.ShadingEnvironmentEntity),
+			WaterEntity:                      a.LookupHash(planetData.WaterEntity),
+			HeathazeEntity:                   a.LookupHash(planetData.HeathazeEntity),
+			PackagePath:                      a.LookupHash(planetData.PackagePath),
+			UnknownFloat:                     planetData.UnknownFloat,
+		}
+		simplePlanetDataArray = append(simplePlanetDataArray, simplePlanetData)
+	}
+
+	output, err := json.MarshalIndent(simplePlanetDataArray, "", "    ")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(string(output))
+}

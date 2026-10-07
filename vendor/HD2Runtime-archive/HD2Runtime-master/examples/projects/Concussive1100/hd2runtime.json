@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "name": "Concussive1100",
+  "resource": "mods/hd2runtime_examples/concussive_1100",
+  "guid": "5a386dde-ce1f-5cb2-9f6a-87ea8a3db721",
+  "requires": {
+    "bingus": {
+      "min_release": 15,
+      "api": 1
+    },
+    "hd2runtime": {
+      "min_version": "0.23.2",
+      "api": 1,
+      "module": "mods/skyeshade/hd2runtime"
+    }
+  },
+  "sdk": "../../../sdk",
+  "ide_library": "../../../sdk/stubs"
+}

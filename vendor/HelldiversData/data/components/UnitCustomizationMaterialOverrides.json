@@ -1,0 +1,7 @@
+{ "UnitCustomizationMaterialOverrides" : {
+    "material_id" : { "type": "uint", "description": "[string]The material id to apply these overrides" },
+    "material_lut" : { "type": "ulong", "description": "[texture]material_lut override path." },
+    "decal_sheet" : { "type": "ulong", "description": "[texture]decal_sheet override path." },
+    "pattern_lut" : { "type": "ulong", "description": "[texture]pattern_lut override path." },
+    "pattern_masks_array" : { "type": "ulong", "description": "[texture]pattern_masks_array override path." }
+}}

@@ -1,0 +1,16 @@
+{ "EmoteInfo" : {
+    "id" : { "type": "uint", "description": "[string]The id for this emote." },
+    "dlc_id" : { "type": "uint", "default": 1288385068, "description": "[string]The id to the backend, if it exists" },
+    "ability" : { "type": "AbilityId", "default": "AbilityId_Invalid", "description": "The ability to play for this emote." },
+    "cancel_ability" : { "type": "AbilityId", "default": "AbilityId_emote_generic_cancel", "description": "The ability to play for this emote when its cancelled." },
+    "preview_anim_event" : { "type": "uint", "description": "[string]The animation event to play for preview." },
+    "cancel_sync_anim_event" : { "type": "uint", "description": "[string]The animation event to play when cancelled." },
+    "cancel_vo" : { "type": "uint", "description": "[string]VO to play when cancelled." },
+    "canceled_animation_time" : { "type": "float", "default": 0, "description": "Time to wait after starting to play a canceled animation." },
+    "input_config" : { "type": "EmoteInputConfiguration", "description": "Settings for if this emote has input options." },
+    "name_upper" : { "type": "uint", "description": "[string]The name of the emote (upper-case LAMS entry key)." },
+    "name_cased" : { "type": "uint", "description": "[string]The name of the emote (mixed-case LAMS entry key)." },
+    "icon" : { "type": "ulong", "description": "[material]The icon of the emote." },
+    "wheel_icon" : { "type": "ulong", "description": "[material]The icon of the emote in the emote wheel." },
+    "response_data" : { "type": "EmoteResponseData" }
+}}

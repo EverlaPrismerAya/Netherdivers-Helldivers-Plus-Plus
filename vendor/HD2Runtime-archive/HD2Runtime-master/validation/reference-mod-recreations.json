@@ -1,0 +1,181 @@
+{
+  "fixtureFallback": "disabled",
+  "mode": "snapshot",
+  "protectionChanges": 0,
+  "recreations": {
+    "BastionReArmoredRecreation": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 52,
+      "phases": 2,
+      "physicalWrites": 58,
+      "referenceSources": [
+        "BastionReArmored/src/release/validate.lua",
+        "BastionReArmored/src/armor_proof/validate.lua",
+        "BastionReArmored/src/lunchbox_proof/validate.lua"
+      ],
+      "referenceWrites": 58,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "ConcussiveDrumMagazine": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 1,
+      "phases": 1,
+      "physicalWrites": 1,
+      "referenceSources": [
+        "HD2Runtime/research/magazine-attachments-F5FEE03DCFDB.json"
+      ],
+      "referenceWrites": 1,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "EmancipatorAmmo": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 2,
+      "phases": 1,
+      "physicalWrites": 2,
+      "referenceSources": [
+        "opus reference materials/Emancipator-Ammo-v1.zip"
+      ],
+      "referenceWrites": 2,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "ExosuitUnlimitedUses": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 4,
+      "phases": 1,
+      "physicalWrites": 4,
+      "referenceSources": [
+        "opus reference materials/Exosuit-Unlimited-Uses-v2 (1).zip"
+      ],
+      "referenceWrites": 4,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "FRVWeaponSwapRecreation": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 2,
+      "phases": 1,
+      "physicalWrites": 2,
+      "referenceSources": [
+        "FRVWeaponSwap/src/current_build.json",
+        "FRVWeaponSwap/src/frv_weapon_swap.lua"
+      ],
+      "referenceWrites": 2,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "JumpPackRecreation": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 2,
+      "phases": 1,
+      "physicalWrites": 2,
+      "referenceSources": [
+        "JumpPackImprovements/src/jump_pack_improvements.lua",
+        "JumpPackImprovements/src/config.lua"
+      ],
+      "referenceWrites": 2,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "LumbererAmmo": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 2,
+      "phases": 1,
+      "physicalWrites": 2,
+      "referenceSources": [
+        "opus reference materials/Lumberer-Ammo-v1.1.zip"
+      ],
+      "referenceWrites": 2,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "M103TurretMagazine": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [
+        {
+          "reason": "The type library and the reference mod disagree on which addend is damage and which is armor penetration; read-only until an in-game test separates them.",
+          "write": "ProjectileWeaponComponent +136/+140 addends set to 35/15"
+        }
+      ],
+      "operations": 1,
+      "phases": 1,
+      "physicalWrites": 1,
+      "referenceSources": [
+        "opus reference materials/Better M-103-FRV-Turret-V1.31.zip"
+      ],
+      "referenceWrites": 1,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "PatriotExosuitBuffs": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [
+        {
+          "reason": "Meaning of the max armor value is not established; not exposed.",
+          "write": "HealthComponent max armor (+288 and each zone +224): hull 0 -> 4, arms 0 -> 10"
+        }
+      ],
+      "operations": 17,
+      "phases": 4,
+      "physicalWrites": 36,
+      "referenceSources": [
+        "opus reference materials/EXO45-Patriot-Buff-1.12.0-EAT17Missile-HMG2000-30Missiles.zip"
+      ],
+      "referenceWrites": 36,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "ReticleAmrRecreation": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 1,
+      "phases": 1,
+      "physicalWrites": 1,
+      "referenceSources": [
+        "ReticleAmr/src/gameplay/patch.lua",
+        "ReticleAmr/research/reticle-policy.md"
+      ],
+      "referenceWrites": 1,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    },
+    "ShieldRelayRecreation": {
+      "allAtVanillaBaseline": true,
+      "missing": [],
+      "omittedReferenceWrites": [],
+      "operations": 5,
+      "phases": 1,
+      "physicalWrites": 6,
+      "referenceSources": [
+        "ShieldRelayImprovements/scripts/shield_reference.py",
+        "ShieldRelayImprovements/scripts/research/physical_hp_reference.py",
+        "ShieldRelayImprovements/scripts/research/stratagem_patch.lua"
+      ],
+      "referenceWrites": 6,
+      "status": "EXACT_MATCH",
+      "unexpected": []
+    }
+  },
+  "researchWrites": 0,
+  "snapshot": "F5FEE03DCFDB-20260926T222226Z.hd2snap",
+  "status": "EXACT_MATCH"
+}

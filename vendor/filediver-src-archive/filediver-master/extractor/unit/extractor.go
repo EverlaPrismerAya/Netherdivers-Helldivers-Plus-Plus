@@ -1,0 +1,1248 @@
+package unit
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"math"
+	"math/rand"
+	"slices"
+	"strings"
+
+	"github.com/qmuntal/gltf"
+	"github.com/qmuntal/gltf/modeler"
+
+	"github.com/go-gl/mathgl/mgl32"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/datalibrary/enum"
+	"github.com/xypwn/filediver/extractor"
+	extr_entity "github.com/xypwn/filediver/extractor/entity"
+	"github.com/xypwn/filediver/extractor/geometry"
+	extr_material "github.com/xypwn/filediver/extractor/material"
+	"github.com/xypwn/filediver/extractor/state_machine"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/bones"
+	"github.com/xypwn/filediver/stingray/unit"
+	geometrygroup "github.com/xypwn/filediver/stingray/unit/geometry_group"
+	"github.com/xypwn/filediver/stingray/unit/material"
+	"github.com/xypwn/filediver/util"
+)
+
+func LoadBoneMap(ctx *extractor.Context, unitInfo *unit.Info) (*bones.Info, error) {
+	if unitInfo.BonesHash.Value == 0x0 {
+		return nil, nil
+	}
+	bonesMainR, err := ctx.Open(stingray.NewFileID(unitInfo.BonesHash, stingray.Sum("bones")), stingray.DataMain)
+	if err == stingray.ErrFileNotExist {
+		return nil, fmt.Errorf("loadBoneMap: bones file does not exist")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loadBoneMap: %w", err)
+	}
+
+	boneInfo, err := bones.LoadBones(bonesMainR)
+	return boneInfo, err
+}
+
+// Adds the unit's skeleton to the gltf document
+func AddSkeleton(ctx *extractor.Context, doc *gltf.Document, unitInfo *unit.Info, armorName *string, passive *datalib.HelldiverCustomizationPassiveBonusSettings) uint32 {
+	boneInfo, err := LoadBoneMap(ctx, unitInfo)
+	if err != nil {
+		ctx.Warnf("addSkeleton: %v", err)
+	}
+
+	if boneInfo != nil {
+		for bone, name := range boneInfo.NameMap {
+			ctx.ThinHashes()[bone] = name
+		}
+	}
+
+	var matrices [][4][4]float32 = make([][4][4]float32, len(unitInfo.JointTransformMatrices))
+	gltfConversionMatrix := mgl32.HomogRotate3DX(mgl32.DegToRad(-90.0)).Mul4(mgl32.HomogRotate3DZ(mgl32.DegToRad(0)))
+	for i := range matrices {
+		jtm := unitInfo.JointTransformMatrices[i]
+		bindMatrix := mgl32.Mat4FromRows(jtm[0], jtm[1], jtm[2], jtm[3]).Transpose()
+		bindMatrix = gltfConversionMatrix.Mul4(bindMatrix)
+		row0, row1, row2, row3 := bindMatrix.Inv().Rows()
+		if row0.LenSqr() == 0 && row1.LenSqr() == 0 && row2.LenSqr() == 0 && row3.LenSqr() == 0 {
+			row0, row1, row2, row3 = mgl32.Ident4().Rows()
+		}
+		matrices[i] = [4][4]float32{row0, row1, row2, row3}
+		unitInfo.Bones[i].Matrix = bindMatrix
+	}
+
+	unitInfo.Bones[0].RecursiveCalcLocalTransforms(&unitInfo.Bones)
+
+	var nodeNames map[string]uint32 = make(map[string]uint32)
+	for i, node := range doc.Nodes {
+		if node.Extras == nil {
+			continue
+		}
+		extras, ok := node.Extras.(map[string]any)
+		if !ok {
+			continue
+		}
+		skeletonIdAny, ok := extras["skeletonId"]
+		if !ok {
+			continue
+		}
+		skeletonId, ok := skeletonIdAny.(uint32)
+		if !ok {
+			continue
+		}
+		nodeNames[node.Name+fmt.Sprintf("%08x", skeletonId)] = uint32(i)
+	}
+
+	skeletonId := unitInfo.Bones[2].NameHash.Value
+	if ctx.RootFileID().Type == stingray.Sum("prefab") || ctx.RootFileID().Type == stingray.Sum("level") {
+		// Only copy skeletons of other matching units in the prefab/level
+		skeletonId = ctx.FileID().Name.Thin().Value
+	}
+	var skeletonTag map[string]any = make(map[string]any)
+	skeletonTag["skeletonId"] = skeletonId
+	if armorName != nil {
+		skeletonTag["armorSet"] = *armorName
+	}
+
+	inverseBindMatrices := modeler.WriteAccessor(doc, gltf.TargetNone, matrices)
+	jointIndices := make([]uint32, 0)
+	boneBaseIndex := uint32(len(doc.Nodes))
+	rootNodeIndex := boneBaseIndex
+	for i, bone := range unitInfo.Bones {
+		quat := mgl32.Mat4ToQuat(bone.Transform.Rotation.Mat4())
+		boneName := fmt.Sprintf("Bone_%08x", bone.NameHash.Value)
+		name, exists := ctx.ThinHashes()[bone.NameHash]
+		if exists {
+			boneName = name
+		}
+		var boneIdx uint32
+		var contains bool = false
+		var parentIndex uint32
+		if boneIdx, contains = nodeNames[boneName+fmt.Sprintf("%08x", skeletonId)]; !contains {
+			parentBone := unitInfo.Bones[bone.ParentIndex]
+			parentName, contains := ctx.ThinHashes()[parentBone.NameHash]
+			if !contains {
+				parentName = fmt.Sprintf("Bone_%08x", parentBone.NameHash.Value)
+			}
+			parentIndex, contains = nodeNames[parentName+fmt.Sprintf("%08x", skeletonId)]
+			if !contains {
+				parentIndex = bone.ParentIndex + boneBaseIndex
+			}
+
+			doc.Nodes = append(doc.Nodes, &gltf.Node{
+				Name:        boneName,
+				Rotation:    quat.V.Vec4(quat.W),
+				Translation: bone.Transform.Translation,
+				Scale:       bone.Transform.Scale,
+				Extras:      skeletonTag,
+			})
+			boneIdx = uint32(len(doc.Nodes) - 1)
+
+			if parentIndex != boneIdx && parentIndex < boneIdx {
+				doc.Nodes[parentIndex].Children = append(doc.Nodes[parentIndex].Children, boneIdx)
+			}
+		} else {
+			if i == 0 {
+				rootNodeIndex = boneIdx
+			}
+			boneBaseIndex -= 1
+		}
+		jointIndices = append(jointIndices, boneIdx)
+	}
+
+	var skeleton *uint32 = nil
+	for skin := range doc.Skins {
+		extras, ok := doc.Skins[skin].Extras.(map[string]any)
+		if !ok {
+			extras = make(map[string]any)
+		}
+		otherIdAny, contains := extras["skeletonId"]
+		if otherId, ok := otherIdAny.(uint32); doc.Skins[skin].Name == ctx.FileID().Name.String() || (contains && ok && skeletonId == otherId) {
+			skeleton = doc.Skins[skin].Skeleton
+			break
+		}
+	}
+
+	if skeleton == nil {
+		unitName := ctx.LookupHash(ctx.FileID().Name)
+		if strings.Contains(unitName, "/") {
+			items := strings.Split(unitName, "/")
+			unitName = items[len(items)-1]
+		}
+		idx := len(doc.Nodes)
+		doc.Nodes = append(doc.Nodes, &gltf.Node{
+			Name: unitName,
+			Children: []uint32{
+				rootNodeIndex,
+			},
+		})
+		if armorName != nil {
+			extras := map[string]any{"armorSet": *armorName}
+			doc.Nodes[idx].Extras = extras
+		}
+		if passive != nil {
+			extras, ok := doc.Nodes[idx].Extras.(map[string]any)
+			if !ok {
+				extras = make(map[string]any)
+			}
+			extras["passiveBonus"] = strings.Join(passive.ResolveDescription(), "<br/>")
+			doc.Nodes[idx].Extras = extras
+		}
+		skeleton = gltf.Index(uint32(idx))
+		doc.Scenes[0].Nodes = append(doc.Scenes[0].Nodes, *skeleton)
+	}
+
+	doc.Skins = append(doc.Skins, &gltf.Skin{
+		Name:                ctx.FileID().Name.String(),
+		InverseBindMatrices: gltf.Index(inverseBindMatrices),
+		Joints:              jointIndices,
+		Skeleton:            skeleton,
+		Extras:              skeletonTag,
+	})
+
+	return uint32(len(doc.Skins) - 1)
+}
+
+func AddMaterialVariant(ctx *extractor.Context, mat *material.Material, doc *gltf.Document, imgOpts *extr_material.ImageOptions, materialId stingray.ThinHash, skinOverride datalib.UnitSkinOverride, metadata *datalib.UnitData) (*uint32, error) {
+	override, ok := skinOverride.Overrides[materialId]
+	if !ok {
+		return nil, fmt.Errorf("Override for %v not found?", ctx.LookupThinHash(materialId))
+	}
+	skinMat := material.Material{
+		BaseMaterial: mat.BaseMaterial,
+		Textures:     maps.Clone(mat.Textures),
+		Settings:     maps.Clone(mat.Settings),
+	}
+	idx := 0
+	if ctx.FileID().Name == stingray.Sum("content/fac_helldivers/hellpod/ammo_rack/ammo_rack") ||
+		ctx.FileID().Name == stingray.Sum("content/fac_helldivers/hellpod/flag_rack/flag_rack") {
+		idx = len(override) - 1
+	}
+	if override[idx].MaterialLut.Value != 0 {
+		skinMat.Textures[stingray.Sum("material_lut").Thin()] = override[idx].MaterialLut
+	}
+	if override[idx].PatternLut.Value != 0 {
+		skinMat.Textures[stingray.Sum("pattern_lut").Thin()] = override[idx].PatternLut
+	}
+	if override[idx].DecalSheet.Value != 0 {
+		skinMat.Textures[stingray.Sum("decal_sheet").Thin()] = override[idx].DecalSheet
+	}
+	if override[idx].PatternMasksArray.Value != 0 {
+		skinMat.Textures[stingray.Sum("pattern_masks_array").Thin()] = override[idx].PatternMasksArray
+	}
+
+	skinMatIdx, err := extr_material.AddMaterial(ctx, &skinMat, doc, imgOpts, materialId, ctx.LookupThinHash(skinOverride.ID)+" "+ctx.LookupThinHash(materialId), metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	return gltf.Index(skinMatIdx), nil
+}
+
+// Most weapons share a name with their entity (what actually has the customization component)
+// but a few do not, so we need to patch those up to get 100% weapon skin export
+// Theoretically we should just be exporting based on entity name rather than unit name, but
+// thats a gigantic can of worms I don't want to get into right now
+func getWeaponEntityHashFromUnitHash(weaponUnit stingray.Hash) stingray.Hash {
+	switch weaponUnit {
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/assault_rifle_penetrator/assault_rifle_penetrator"):
+		weaponUnit = stingray.Hash{Value: 0x43cb1033961a2276}
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/marksman_rifle_vigilance_counter_sniper/marksman_rifle_vigilance_counter_sniper"):
+		weaponUnit = stingray.Hash{Value: 0x4c786785c79d44e7}
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/assault_shotgun_sprayandpray/assault_shotgun_sprayandpray"):
+		weaponUnit = stingray.Hash{Value: 0x5ebaea70c0d060b9}
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/jet_rifle_phoenix/jet_rifle_phoenix"):
+		weaponUnit = stingray.Hash{Value: 0xb6aff2195568767f}
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/assault_rifle_explosive/assault_rifle_explosive"):
+		weaponUnit = stingray.Hash{Value: 0xcf5f176e0e322be1}
+	case stingray.Sum("content/fac_helldivers/equipment/primary_weapons/plasma_rifle_charge/plasma_rifle_charge"):
+		weaponUnit = stingray.Hash{Value: 0xfb3a19078694708a}
+	}
+	return weaponUnit
+}
+
+func AddMaterials(ctx *extractor.Context, doc *gltf.Document, imgOpts *extr_material.ImageOptions, unitInfo *unit.Info, metadata *datalib.UnitData) ([]geometry.MaterialVariantMap, error) {
+	cfg := ctx.Config()
+	materialVariants := make([]geometry.MaterialVariantMap, 0)
+	namesToVariantIdx := make(map[string]uint32)
+
+	// Check if this is a weapon with weapon customization component or an attachment in the weapon customization settings
+	weaponHash := getWeaponEntityHashFromUnitHash(ctx.FileID().Name)
+	weaponCustCmpData, weaponErr := datalib.GetWeaponCustomizationComponentDataForHash(weaponHash)
+
+	attachmentSlot, isAttachment := ctx.AttachmentSlots()[ctx.FileID().Name]
+	var weaponCustCmp datalib.WeaponCustomizationComponent
+	if weaponErr == nil {
+		if _, err := binary.Decode(weaponCustCmpData, binary.LittleEndian, &weaponCustCmp); err != nil {
+			ctx.Warnf("AddMaterials: couldn't parse weapon customization component: %v", err)
+			weaponErr = err
+		}
+	} else if isAttachment {
+		weaponErr = nil
+		weaponCustCmpData = make([]byte, binary.Size(weaponCustCmp))
+		weaponCustCmp = datalib.DefaultWeaponCustomizationComponent()
+		if _, err := binary.Encode(weaponCustCmpData, binary.LittleEndian, weaponCustCmp); err != nil {
+			ctx.Warnf("AddMaterials: making a fake weapon customization component failed: %v", err)
+			weaponErr = err
+		}
+	}
+
+	// Check if this is a helldiver carried weapon vs vehicle mounted (has EquipmentComponentData)
+	equipmentData, _ := datalib.GetEquipmentComponentDataForHash(weaponHash)
+	isHelldiverWeapon := len(equipmentData) > 0
+
+	var colorGradingDDS bytes.Buffer
+	if err := extr_entity.WriteColorGradingLut(ctx, &colorGradingDDS); err != nil {
+		ctx.Warnf("Writing color grading lut: %v", err)
+	}
+
+	for id, resID := range unitInfo.Materials {
+		resID = ctx.OverrideMaterial(id, resID)
+		materialId := ctx.OverrideAsset(stingray.NewFileID(resID, stingray.Sum("material")))
+		matR, err := ctx.Open(materialId, stingray.DataMain)
+		if err != nil {
+			return nil, err
+		}
+		mat, err := material.LoadMain(matR)
+		if err != nil {
+			return nil, err
+		}
+
+		has_grading := slices.ContainsFunc(slices.Collect(maps.Keys(mat.Settings)), func(name stingray.ThinHash) bool {
+			return strings.Contains(ctx.LookupThinHash(name), "grading_group_id")
+		})
+
+		if has_grading {
+			extr_material.AddColorGradingLUT(ctx, doc, colorGradingDDS, mat)
+		}
+
+		resPath := ctx.LookupHash(materialId.Name)
+		if strings.Contains(resPath, "/") {
+			split := strings.Split(resPath, "/")
+			resPath = strings.Join(split[len(split)-2:], "/")
+		}
+		matIdx, err := extr_material.AddMaterial(ctx.WithFileID(materialId), mat, doc, imgOpts, id, ctx.LookupThinHash(id)+" "+resPath, metadata)
+		if err != nil {
+			return nil, err
+		}
+
+		// Using a slice+map combo to maintain variant order
+		// Otherwise different pieces would have different variant indices
+		// and combining them in a single file would result in random variants
+		// selected every time the skin was changed
+		if _, ok := namesToVariantIdx["default"]; !ok {
+			namesToVariantIdx["default"] = uint32(len(materialVariants))
+			materialVariants = append(materialVariants, geometry.MaterialVariantMap{
+				Name:                "default",
+				MaterialHashToIndex: make(map[stingray.ThinHash]uint32),
+			})
+		}
+		materialVariants[namesToVariantIdx["default"]].MaterialHashToIndex[id] = matIdx
+
+		if ctx.RootFileID().Type == stingray.Sum("level") {
+			// If we're exporting a level, just use the default material, don't make any variants
+			continue
+		}
+
+		entityHash := ctx.FileID().Name
+		if cfg.Unit.EntityName != "" {
+			newHash, err := stingray.ParseOrSum(cfg.Unit.EntityName)
+			if err == nil {
+				entityHash = newHash
+			}
+		}
+
+		{
+			// Handle vehicle variants
+			var skinOverrides []datalib.UnitSkinOverride = make([]datalib.UnitSkinOverride, 0)
+			for _, skinOverrideGroup := range ctx.SkinOverrideGroups() {
+				if !skinOverrideGroup.HasMaterial(id) || isHelldiverWeapon {
+					continue
+				}
+				skinOverrides = skinOverrideGroup.Skins
+				unit, err := skinOverrideGroup.CollectionType.Unit()
+				if err != nil {
+					continue
+				}
+				if entityHash == unit {
+					break
+				}
+			}
+			for _, skinOverride := range skinOverrides {
+				skinName := cases.Title(language.English).String(skinOverride.Name)
+
+				if _, ok := skinOverride.Overrides[id]; !ok {
+					continue
+				}
+
+				skinMatIdx, err := AddMaterialVariant(ctx.WithFileID(materialId), mat, doc, imgOpts, id, skinOverride, metadata)
+				if err != nil {
+					// Some materials don't get overriden, that's fine
+					continue
+				}
+
+				if _, ok := namesToVariantIdx[skinName]; !ok {
+					namesToVariantIdx[skinName] = uint32(len(materialVariants))
+					materialVariants = append(materialVariants, geometry.MaterialVariantMap{
+						Name:                skinName,
+						MaterialHashToIndex: make(map[stingray.ThinHash]uint32),
+					})
+				}
+				materialVariants[namesToVariantIdx[skinName]].MaterialHashToIndex[id] = *skinMatIdx
+			}
+		}
+
+		func() {
+			// Handle entity material swaps
+			materialSwapData, err := datalib.GetMaterialSwapComponentDataForHash(entityHash)
+			if err != nil {
+				return
+			}
+
+			var materialSwap datalib.MaterialSwapComponent
+			if _, err := binary.Decode(materialSwapData, binary.LittleEndian, &materialSwap); err != nil {
+				return
+			}
+
+			for _, slot := range materialSwap.MaterialSlots {
+				for i, swap := range slot.SwapSettings {
+					if swap.Name.Value == 0x0 {
+						continue
+					}
+
+					if i == 0 && cfg.Unit.EntityOverrideDefault {
+						// The default material has this material, so don't make a variant out of it
+						continue
+					}
+
+					swapId := stingray.NewFileID(swap.Material, stingray.Sum("material"))
+
+					matR, err := ctx.Open(swapId, stingray.DataMain)
+					if err != nil {
+						continue
+					}
+					swapMat, err := material.LoadMain(matR)
+					if err != nil {
+						continue
+					}
+
+					resPath := ctx.LookupHash(swapId.Name)
+					if strings.Contains(resPath, "/") {
+						split := strings.Split(resPath, "/")
+						resPath = strings.Join(split[len(split)-2:], "/")
+					}
+
+					skinName := ctx.LookupThinHash(swap.Name) + " " + ctx.LookupThinHash(slot.MaterialSlotName) + " " + resPath
+					skinMatIdx, err := extr_material.AddMaterial(ctx.WithFileID(swapId), swapMat, doc, imgOpts, slot.MaterialSlotName, skinName, metadata)
+					if err != nil {
+						continue
+					}
+
+					if _, ok := namesToVariantIdx[ctx.LookupThinHash(swap.Name)]; !ok {
+						namesToVariantIdx[ctx.LookupThinHash(swap.Name)] = uint32(len(materialVariants))
+						materialVariants = append(materialVariants, geometry.MaterialVariantMap{
+							Name:                ctx.LookupThinHash(swap.Name),
+							MaterialHashToIndex: make(map[stingray.ThinHash]uint32),
+						})
+					}
+
+					materialVariants[namesToVariantIdx[ctx.LookupThinHash(swap.Name)]].MaterialHashToIndex[slot.MaterialSlotName] = skinMatIdx
+				}
+			}
+		}()
+
+		{
+			// Handle weapon variants
+			if weaponErr != nil {
+				continue
+			}
+
+			foundPaintScheme := false
+			for _, slot := range weaponCustCmp.CustomizationSlots {
+				if slot == enum.WeaponCustomizationSlot_PaintScheme {
+					foundPaintScheme = true
+					break
+				}
+			}
+			if !foundPaintScheme {
+				continue
+			}
+
+			// This is memoized so we don't actually parse entity deltas every time this is called
+			entityDeltas, err := datalib.ParseEntityDeltas()
+			if err != nil {
+				ctx.Warnf("AddMaterials: couldn't parse entity deltas: %v", err)
+				continue
+			}
+			for _, paintScheme := range ctx.WeaponPaintSchemes() {
+				if paintScheme.NameUpper == "DEFAULT" {
+					continue
+				}
+				delta, ok := entityDeltas[paintScheme.AddPath]
+				if !ok {
+					ctx.Warnf("AddMaterials: no delta for add path %v", ctx.LookupHash(paintScheme.AddPath))
+					continue
+				}
+
+				modifiedComponentData, err := datalib.PatchComponent(datalib.Sum("WeaponCustomizationComponentData"), weaponCustCmpData, delta)
+				if err != nil {
+					ctx.Warnf("AddMaterials: couldn't patch component: %v", err)
+					continue
+				}
+
+				var component datalib.WeaponCustomizationComponent
+				if _, err := binary.Decode(modifiedComponentData, binary.LittleEndian, &component); err != nil {
+					ctx.Warnf("AddMaterials: couldn't parse component: %v", err)
+					continue
+				}
+
+				var tempSkinOverride datalib.UnitSkinOverride
+				tempSkinOverride.Name = cases.Title(language.English).String(paintScheme.NameUpper)
+				tempSkinOverride.ID = paintScheme.ID
+				tempSkinOverride.Overrides = make(map[stingray.ThinHash][]datalib.UnitCustomizationMaterialOverrides)
+				for _, matOverride := range component.MaterialOverride.DefaultWeaponSlotMaterial {
+					if matOverride.MaterialID.Value == 0 {
+						continue
+					}
+					if _, ok := tempSkinOverride.Overrides[matOverride.MaterialID]; !ok {
+						tempSkinOverride.Overrides[matOverride.MaterialID] = make([]datalib.UnitCustomizationMaterialOverrides, 0)
+					}
+					tempSkinOverride.Overrides[matOverride.MaterialID] = append(tempSkinOverride.Overrides[matOverride.MaterialID], matOverride)
+				}
+
+				for _, slotCustomization := range component.MaterialOverride.WeaponSlotMaterialCustomization {
+					if isAttachment && attachmentSlot != slotCustomization.Slot {
+						continue
+					}
+					for _, matOverride := range slotCustomization.Overrides {
+						if matOverride.MaterialID.Value == 0 {
+							continue
+						}
+						if _, ok := tempSkinOverride.Overrides[matOverride.MaterialID]; !ok {
+							tempSkinOverride.Overrides[matOverride.MaterialID] = make([]datalib.UnitCustomizationMaterialOverrides, 0)
+						}
+						tempSkinOverride.Overrides[matOverride.MaterialID] = append(tempSkinOverride.Overrides[matOverride.MaterialID], matOverride)
+					}
+				}
+
+				skinMatIdx, err := AddMaterialVariant(ctx.WithFileID(materialId), mat, doc, imgOpts, id, tempSkinOverride, metadata)
+				if err != nil {
+					// Some materials don't get overriden, that's fine
+					continue
+				}
+
+				if _, ok := namesToVariantIdx[tempSkinOverride.Name]; !ok {
+					namesToVariantIdx[tempSkinOverride.Name] = uint32(len(materialVariants))
+					materialVariants = append(materialVariants, geometry.MaterialVariantMap{
+						Name:                tempSkinOverride.Name,
+						MaterialHashToIndex: make(map[stingray.ThinHash]uint32),
+					})
+				}
+				materialVariants[namesToVariantIdx[tempSkinOverride.Name]].MaterialHashToIndex[id] = *skinMatIdx
+			}
+		}
+	}
+	return materialVariants, nil
+}
+
+func AddPrefabMetadata(ctx *extractor.Context, doc *gltf.Document, root *uint32, skin *uint32, meshNodes []uint32, armorSetName *string) {
+	if armorSetName != nil {
+		for _, node := range meshNodes {
+			extras, ok := doc.Nodes[node].Extras.(map[string]any)
+			if !ok {
+				extras = make(map[string]any)
+			}
+			extras["armorSet"] = *armorSetName
+			doc.Nodes[node].Extras = extras
+		}
+	}
+
+	rootExtras, ok := doc.Nodes[*root].Extras.(map[string]any)
+	if !ok {
+		rootExtras = make(map[string]any)
+	}
+	rootExtras["hash"] = GetUnitExtrasID(ctx.FileID())
+	doc.Nodes[*root].Extras = rootExtras
+
+	extras, ok := doc.Extras.(map[string]any)
+	if !ok {
+		extras = make(map[string]any)
+	}
+	prefabMetadata := make(map[string]any)
+	prefabMetadata["root"] = *root
+	if skin != nil {
+		prefabMetadata["skin"] = *skin
+	}
+	prefabMetadata["objects"] = meshNodes
+	prefabMetadata["parent"] = nil
+	extras[GetUnitExtrasID(ctx.FileID())] = prefabMetadata
+	doc.Extras = extras
+}
+
+func findBoneRecursive(doc *gltf.Document, currentNode uint32, boneName string) *uint32 {
+	if doc.Nodes[currentNode].Name == boneName {
+		return gltf.Index(currentNode)
+	}
+	for _, child := range doc.Nodes[currentNode].Children {
+		res := findBoneRecursive(doc, child, boneName)
+		if res != nil {
+			return res
+		}
+	}
+	return nil
+}
+
+func findBone(ctx *extractor.Context, doc *gltf.Document, parent *uint32, namehash stingray.ThinHash) *uint32 {
+	boneName, ok := ctx.ThinHashes()[namehash]
+	if !ok {
+		boneName = fmt.Sprintf("Bone_%08x", namehash.Value)
+	}
+
+	return findBoneRecursive(doc, *parent, boneName)
+}
+
+func AddLights(ctx *extractor.Context, doc *gltf.Document, unitInfo *unit.Info, parent *uint32) {
+	if len(unitInfo.Lights) == 0 {
+		return
+	}
+
+	if !slices.Contains(doc.ExtensionsUsed, "KHR_lights_punctual") {
+		doc.ExtensionsUsed = append(doc.ExtensionsUsed, "KHR_lights_punctual")
+	}
+
+	var gltfLights []map[string]any = make([]map[string]any, 0)
+	lightsPunctualIFace, contains := doc.Extensions["KHR_lights_punctual"]
+	if contains {
+		lightsPunctual, ok := lightsPunctualIFace.(map[string]any)
+		if ok {
+			gltfLightsIface, contains := lightsPunctual["lights"]
+			if contains {
+				gltfLightMap, ok := gltfLightsIface.([]map[string]any)
+				if ok {
+					gltfLights = gltfLightMap
+				}
+			}
+		}
+	}
+	for _, light := range unitInfo.Lights {
+		if light.BoneIndex >= uint32(len(unitInfo.Bones)) {
+			ctx.Warnf("light %v has bone index exceeding length of unit bones list", ctx.LookupThinHash(light.NameHash))
+			return
+		}
+
+		boneGltfIdx := findBone(ctx, doc, parent, unitInfo.Bones[light.BoneIndex].NameHash)
+		if boneGltfIdx == nil {
+			ctx.Warnf("could not find bone %v to attach light %v", ctx.LookupThinHash(unitInfo.Bones[light.BoneIndex].NameHash), ctx.LookupThinHash(light.NameHash))
+			return
+		}
+
+		lightGltfIdx := len(gltfLights)
+		lightNodeIdx := len(doc.Nodes)
+		quat := mgl32.QuatRotate(mgl32.DegToRad(90), mgl32.Vec3{1.0, 0.0, 0.0})
+		doc.Nodes = append(doc.Nodes, &gltf.Node{
+			Name:     ctx.LookupThinHash(light.NameHash),
+			Rotation: quat.V.Vec4(quat.W),
+			Extensions: map[string]any{
+				"KHR_lights_punctual": map[string]any{
+					"light": lightGltfIdx,
+				},
+			},
+		})
+
+		doc.Nodes[*boneGltfIdx].Children = append(doc.Nodes[*boneGltfIdx].Children, uint32(lightNodeIdx))
+
+		maxColor := float32(math.Max(math.Max(float64(light.Color[0]), float64(light.Color[1])), float64(light.Color[2])))
+		intensity := light.Intensity
+		if maxColor > 1.0 {
+			light.Color[0] /= maxColor
+			light.Color[1] /= maxColor
+			light.Color[2] /= maxColor
+			intensity *= maxColor
+		}
+		gltfLight := map[string]any{
+			"name":      ctx.LookupThinHash(light.NameHash),
+			"type":      light.Type.ToGLTF(),
+			"color":     light.Color,
+			"intensity": intensity * 100.0,
+		}
+		if light.Type != unit.LightDirectional {
+			gltfLight["range"] = light.FalloffEnd
+		}
+		if light.Type == unit.LightSpot {
+			spot := map[string]any{
+				"innerConeAngle": light.SpotInnerAngle,
+				"outerConeAngle": light.SpotOuterAngle,
+			}
+			gltfLight["spot"] = spot
+		}
+		gltfLights = append(gltfLights, gltfLight)
+	}
+	if doc.Extensions == nil {
+		doc.Extensions = make(gltf.Extensions)
+	}
+	doc.Extensions["KHR_lights_punctual"] = map[string]any{
+		"lights": gltfLights,
+	}
+}
+
+func chooseRandomSubregion(subregions []datalib.SubRegionSettings) datalib.SubRegionSettings {
+	var totalWeight float32 = 0.0
+	buckets := make([]struct {
+		min float32
+		max float32
+	}, len(subregions))
+	for i, subregion := range subregions {
+		buckets[i].min = totalWeight
+		totalWeight += subregion.Weight
+		buckets[i].max = totalWeight
+	}
+
+	selection := rand.Float32() * totalWeight
+	for i, bucket := range buckets {
+		if bucket.min == bucket.max {
+			continue
+		}
+		if bucket.min <= selection && selection < bucket.max {
+			return subregions[i]
+		}
+	}
+	return subregions[len(subregions)-1]
+}
+
+func chooseRandomRegionVariant(variants []datalib.GenerationRegionVariantSettings) datalib.GenerationRegionVariantSettings {
+	var totalWeight float32 = 0.0
+	buckets := make([]struct {
+		min float32
+		max float32
+	}, len(variants))
+	for i, variant := range variants {
+		buckets[i].min = totalWeight
+		totalWeight += variant.Weight
+		buckets[i].max = totalWeight
+	}
+
+	selection := rand.Float32() * totalWeight
+	for i, bucket := range buckets {
+		if bucket.min == bucket.max {
+			continue
+		}
+		if bucket.min <= selection && selection < bucket.max {
+			return variants[i]
+		}
+	}
+	return variants[len(variants)-1]
+}
+
+func getZone(ctx *extractor.Context, variantType enum.LevelGenerationRegionVariantType) (*datalib.ZoneSettings, error) {
+	variants, err := datalib.LoadRegionSettings(ctx.LookupHash, ctx.LookupThinHash, ctx.LookupString)
+	if err != nil {
+		return nil, err
+	}
+
+	subregions := variants[variantType-1].SubregionSettings
+
+	var subregionType *enum.SubRegionType
+	subRegionName := cases.Lower(language.English).String(ctx.Config().Planet.SubRegion)
+	if sub, contains := enum.SubRegionFriendlyMapLower[subRegionName]; contains && sub != enum.SubRegionType_None {
+		subregionType = &sub
+	}
+	idx := slices.IndexFunc(subregions, func(sub datalib.SubRegionSettings) bool { return subregionType != nil && sub.Type == *subregionType })
+
+	var subregion datalib.SubRegionSettings
+	if idx == -1 {
+		subregion = chooseRandomSubregion(subregions)
+		if subregionType != nil {
+			ctx.Warnf("subregion '%v' does not exist in region '%v', using random subregion '%v' instead.", ctx.Config().Planet.SubRegion, ctx.Config().Planet.Region, subregion.Type.FriendlyString())
+		}
+	} else {
+		subregion = subregions[idx]
+	}
+
+	zoneId := subregion.Zone
+	zones, err := datalib.LoadZoneSettings(ctx.LookupHash, ctx.LookupThinHash, ctx.LookupString)
+	if err != nil {
+		return nil, err
+	}
+	ctx.Statusf("Using %v subregion %v: %v", variantType.FriendlyString(), subregion.Type.FriendlyString(), zoneId.String())
+	return &zones[zoneId-1], nil
+}
+
+func getZoneFromRegion(ctx *extractor.Context) (*datalib.ZoneSettings, error) {
+	regionName := cases.Lower(language.English).String(ctx.Config().Planet.Region)
+	region, contains := enum.LevelGenerationRegionVariantFriendlyMapLower[regionName]
+	if !contains || region == enum.LevelGenerationRegionVariant_none {
+		return nil, fmt.Errorf("no valid region selected")
+	}
+
+	return getZone(ctx, region)
+}
+
+func getZoneFromPlanet(ctx *extractor.Context) (*datalib.ZoneSettings, error) {
+	cfg := ctx.Config()
+	caser := cases.Lower(language.English)
+	planet, contains := ctx.Planets()[caser.String(cfg.Planet.Name)]
+	if !contains {
+		return nil, fmt.Errorf("no valid planet selected")
+	}
+
+	region, contains := ctx.PlanetRegionsMap()[planet.RegionHighland.Id]
+	if !contains {
+		// planet region highland and region lowland have the same id for every planet in the game
+		// so theres no point in checking the other one here
+		return nil, fmt.Errorf("planet %v doesn't have a valid region (this shouldn't happen)", cfg.Planet.Name)
+	}
+
+	variant := chooseRandomRegionVariant(region.Variants)
+
+	return getZone(ctx, variant.Type)
+}
+
+type materialGeneratorSettings struct {
+	MaterialIndex uint32         `json:"index"`
+	Settings      map[string]any `json:"settings"`
+}
+
+type materialMapEntry struct {
+	name stingray.Hash
+	mat  *material.Material
+}
+
+func addTerrainProjectors(ctx *extractor.Context, doc *gltf.Document, imgOpts *extr_material.ImageOptions, zone datalib.ZoneSettings, colorGradingDDS bytes.Buffer, materialLookupUnits [3]stingray.Hash) (stingray.Hash, []materialGeneratorSettings, error) {
+	noiseMap := stingray.Sum("")
+	var materialLookups []*unit.Info
+	for _, lookupUnit := range materialLookupUnits {
+		fMain, err := ctx.Open(stingray.NewFileID(lookupUnit, stingray.Sum("unit")), stingray.DataMain)
+		if err != nil {
+			return noiseMap, nil, fmt.Errorf("Failed to open terrain lookup unit %v: %v", ctx.LookupHash(lookupUnit), err)
+		}
+		materialLookup, err := unit.LoadInfo(fMain)
+		if err != nil {
+			return noiseMap, nil, fmt.Errorf("Failed to load terrain lookup unit %v: %v", ctx.LookupHash(lookupUnit), err)
+		}
+		materialLookups = append(materialLookups, materialLookup)
+	}
+	materialMap := make(map[int]materialMapEntry)
+	for _, lookup := range materialLookups {
+		for _, matHash := range lookup.Materials {
+			materialId := ctx.OverrideAsset(stingray.NewFileID(matHash, stingray.Sum("material")))
+			matR, err := ctx.Open(materialId, stingray.DataMain)
+			if err != nil {
+				return noiseMap, nil, fmt.Errorf("could not open terrain material %v: %v", ctx.LookupHash(matHash), err)
+			}
+			mat, err := material.LoadMain(matR)
+			if err != nil {
+				return noiseMap, nil, fmt.Errorf("could not load terrain material %v: %v", ctx.LookupHash(matHash), err)
+			}
+			materialIndexSetting, contains := mat.Settings[stingray.Sum("material_index").Thin()]
+			if !contains {
+				continue
+			}
+			materialIndex := int(materialIndexSetting[0])
+			materialMap[materialIndex] = materialMapEntry{
+				name: matHash,
+				mat:  mat,
+			}
+		}
+	}
+	result := make([]materialGeneratorSettings, 0)
+	for _, materialGenerator := range zone.MaterialGenerators {
+		generatorMap := materialGenerator.Map()
+		materialIndexSetting, contains := generatorMap[stingray.Sum("material").Thin()]
+		if !contains {
+			return noiseMap, nil, fmt.Errorf("Material generator did not reference a material?")
+		}
+
+		genMatR, err := ctx.Open(stingray.NewFileID(materialGenerator.Shader, stingray.Sum("material")), stingray.DataMain)
+		if err != nil {
+			return noiseMap, nil, fmt.Errorf("could not open material noise generator %v: %v", ctx.LookupHash(materialGenerator.Shader), err)
+		}
+		genMat, err := material.LoadMain(genMatR)
+		if err != nil {
+			return noiseMap, nil, fmt.Errorf("could not load material noise generator %v: %v", ctx.LookupHash(materialGenerator.Shader), err)
+		}
+		if tex, contains := genMat.Textures[stingray.Sum("texture_map_0b1b5dad").Thin()]; contains && noiseMap != tex {
+			noiseMap = tex
+		}
+
+		materialIndex := int(materialIndexSetting.Value)
+		matEntry, contains := materialMap[materialIndex]
+		if !contains {
+			ctx.Warnf("material noise generator requested material index %v not present in lookup units, skipping", materialIndex)
+			continue
+		}
+		mat := matEntry.mat
+		materialPath := matEntry.name
+		extr_material.AddColorGradingLUT(ctx, doc, colorGradingDDS, mat)
+		matIdx, err := extr_material.AddMaterial(ctx.WithFileID(stingray.NewFileID(materialPath, stingray.Sum("material"))), mat, doc, imgOpts, stingray.Sum("terrain").Thin(), "terrain "+ctx.LookupHash(materialPath), nil)
+		if err != nil {
+			return noiseMap, nil, fmt.Errorf("could not add terrain material %v: %v", ctx.LookupHash(materialPath), err)
+		}
+
+		var generator materialGeneratorSettings
+		generator.Settings = make(map[string]any)
+		for name, setting := range generatorMap {
+			if setting.Vector.Count > 0 {
+				generator.Settings[ctx.LookupThinHash(name)] = setting.Vector.Vec4[:setting.Vector.Count]
+			} else {
+				generator.Settings[ctx.LookupThinHash(name)] = []float32{setting.Value}
+			}
+		}
+		generator.MaterialIndex = matIdx
+
+		result = append(result, generator)
+	}
+	return noiseMap, result, nil
+}
+
+func AddTerrainMaterial(ctx *extractor.Context, doc *gltf.Document, imgOpts *extr_material.ImageOptions, terrainMaterialID stingray.FileID) *uint32 {
+	zone, err := getZoneFromRegion(ctx)
+	if err != nil {
+		var err2 error
+		zone, err2 = getZoneFromPlanet(ctx)
+		if err2 != nil {
+			ctx.Warnf("Failed to get zone for terrain material: %v and %v", err, err2)
+		}
+	}
+
+	caser := cases.Lower(language.English)
+	planet, contains := ctx.Planets()[caser.String(ctx.Config().Planet.Name)]
+
+	if zone == nil || !contains {
+		ctx.Warnf("Defaulting to Super Earth since no planet was specified")
+		planetName := "super earth"
+		planet, contains = ctx.Planets()[planetName]
+		if !contains {
+			ctx.Warnf("Super Earth doesn't have settings associated with it? (This shouldn't happen)")
+			return nil
+		}
+
+		region, contains := ctx.PlanetRegionsMap()[planet.RegionHighland.Id]
+		if !contains {
+			// planet region highland and region lowland have the same id for every planet in the game
+			// so theres no point in checking the other one here
+			ctx.Warnf("Super Earth doesn't have a valid region (this shouldn't happen)")
+			return nil
+		}
+
+		variant := chooseRandomRegionVariant(region.Variants)
+
+		zone, err = getZone(ctx, variant.Type)
+		if err != nil {
+			ctx.Warnf("Super Earth doesn't have a valid zone (this shouldn't happen)")
+			return nil
+		}
+	}
+
+	var materials []materialGeneratorSettings
+	var noiseMap stingray.Hash
+	if zone != nil {
+		var colorGradingDDS bytes.Buffer
+		if err := extr_entity.WriteColorGradingLut(ctx, &colorGradingDDS); err != nil {
+			ctx.Warnf("Writing terrain color grading lut: %v", err)
+		}
+		noiseMap, materials, err = addTerrainProjectors(ctx, doc, imgOpts, *zone, colorGradingDDS, [3]stingray.Hash{planet.MaterialLookupUnit1, planet.MaterialLookupUnit2, planet.MaterialLookupUnit3})
+		if err != nil {
+			ctx.Warnf("Failed to add terrain projectors: %v", err)
+		}
+	}
+
+	matR, err := ctx.Open(terrainMaterialID, stingray.DataMain)
+	if err != nil {
+		ctx.Warnf("Failed to load terrain material for %v", ctx.LookupHash(terrainMaterialID.Name))
+		return nil
+	}
+	mat, err := material.LoadMain(matR)
+	if err != nil {
+		return nil
+	}
+	resPath := ctx.LookupHash(terrainMaterialID.Name)
+	if strings.Contains(resPath, "/") {
+		split := strings.Split(resPath, "/")
+		resPath = strings.Join(split[len(split)-2:], "/")
+	}
+	mat.Textures[stingray.Sum("texture_map_0b1b5dad").Thin()] = noiseMap
+
+	matIdx, err := extr_material.AddMaterial(ctx.WithFileID(terrainMaterialID), mat, doc, imgOpts, stingray.Sum("terrain").Thin(), "terrain "+resPath, nil)
+	if err != nil {
+		return nil
+	}
+
+	if materials != nil {
+		extras, ok := doc.Materials[matIdx].Extras.(map[string]any)
+		if !ok {
+			extras = make(map[string]any)
+		}
+		extras["fd_terrain_materials"] = materials
+		doc.Materials[matIdx].Extras = extras
+	}
+
+	return &matIdx
+}
+
+func AddTerrain(ctx *extractor.Context, doc *gltf.Document, unitInfo *unit.Info, meshNodes *[]uint32) []uint32 {
+	terrainNodes := make([]uint32, 0)
+	var matIdx *uint32
+	terrainMaterialID := stingray.NewFileID(ctx.FileID().Name, stingray.Sum("material"))
+	if ctx.Exists(terrainMaterialID, stingray.DataMain) {
+		opts, err := extr_material.GetImageOpts(ctx)
+		if err != nil {
+			return terrainNodes
+		}
+		matIdx = AddTerrainMaterial(ctx, doc, opts, terrainMaterialID)
+	}
+	for _, terrainInfo := range unitInfo.TerrainInfos {
+		mesh, err := unit.LoadTerrain(terrainInfo)
+		if err != nil {
+			ctx.Warnf("Error loading terrain: %v", err)
+			return terrainNodes
+		}
+		terrainMesh := uint32(len(doc.Meshes))
+		doc.Meshes = append(doc.Meshes, &gltf.Mesh{
+			Primitives: []*gltf.Primitive{{
+				Indices: gltf.Index(modeler.WriteIndices(doc, mesh.Indices[0])),
+				Attributes: gltf.Attribute{
+					gltf.POSITION:   modeler.WritePosition(doc, mesh.Positions),
+					gltf.NORMAL:     modeler.WriteNormal(doc, mesh.Normals),
+					gltf.TANGENT:    modeler.WriteTangent(doc, mesh.Tangents),
+					gltf.TEXCOORD_0: modeler.WriteTextureCoord(doc, mesh.UVCoords[0]),
+				},
+				Material: matIdx,
+			}},
+		})
+		terrainNode := uint32(len(doc.Nodes))
+		doc.Nodes = append(doc.Nodes, &gltf.Node{
+			Name: ctx.LookupThinHash(terrainInfo.ParentBone) + " " + ctx.LookupThinHash(terrainInfo.Name),
+			Mesh: gltf.Index(terrainMesh),
+		})
+		*meshNodes = append(*meshNodes, terrainNode)
+		terrainNodes = append(terrainNodes, terrainNode)
+	}
+	return terrainNodes
+}
+
+func GetUnitExtrasID(fileId stingray.FileID) string {
+	return fileId.Name.String() + ".unit"
+}
+
+func ConvertOpts(ctx *extractor.Context, imgOpts *extr_material.ImageOptions, gltfDoc *gltf.Document) error {
+	fMain, err := ctx.Open(ctx.FileID(), stingray.DataMain)
+	if err != nil {
+		return err
+	}
+	var fGPU io.ReadSeeker
+	if ctx.Exists(ctx.FileID(), stingray.DataGPU) {
+		fGPU, err = ctx.Open(ctx.FileID(), stingray.DataGPU)
+		if err != nil {
+			return err
+		}
+	}
+
+	cfg := ctx.Config()
+
+	unitInfo, err := unit.LoadInfo(fMain)
+	if err != nil {
+		return err
+	}
+
+	doc := extractor.GetDocument(ctx, gltfDoc)
+
+	// Get metadata
+	var metadata *datalib.UnitData = nil
+	var passive *datalib.HelldiverCustomizationPassiveBonusSettings = nil
+	var armorSetName *string = nil
+	var armorSets []datalib.ArmorSet = make([]datalib.ArmorSet, 0)
+	if armorSet, ok := ctx.GuessFileArmorSet(ctx.FileID()); ok {
+		armorSetName = &armorSet.Name
+		passive = armorSet.Passive
+		if _, contains := armorSet.UnitMetadata[ctx.FileID().Name]; contains {
+			value := armorSet.UnitMetadata[ctx.FileID().Name]
+			metadata = &value
+			armorSets = append(armorSets, armorSet)
+		}
+	}
+
+	if ctx.FileID().Name == stingray.Sum("content/fac_helldivers/capes/medium_cape") || ctx.FileID().Name == stingray.Sum("content/fac_helldivers/capes/shock_trooper_cape") {
+		for _, armorSet := range ctx.ArmorSets() {
+			if armorSet.Type == datalib.KitCape {
+				armorSets = append(armorSets, armorSet)
+			}
+		}
+	}
+
+	var materialIdxs []geometry.MaterialVariantMap = make([]geometry.MaterialVariantMap, 0)
+	// Load materials
+	if len(armorSets) == 0 {
+		materialIdxs, err = AddMaterials(ctx, doc, imgOpts, unitInfo, metadata)
+		if err != nil {
+			return err
+		}
+	} else {
+		for _, armorSet := range armorSets {
+			for hash, meta := range armorSet.UnitMetadata {
+				if armorSet.Type != datalib.KitCape && hash != ctx.FileID().Name {
+					continue
+				}
+				tmp, err := AddMaterials(ctx, doc, imgOpts, unitInfo, &meta)
+				if err != nil {
+					return err
+				}
+				if armorSet.Type == datalib.KitCape {
+					for _, idx := range tmp[0].MaterialHashToIndex {
+						slot := strings.Split(doc.Materials[idx].Name, " ")[0]
+						doc.Materials[idx].Name = slot + " " + util.PrettyTitleCase(armorSet.Name)
+					}
+					tmp[0].Name = util.PrettyTitleCase(armorSet.Name)
+				}
+				materialIdxs = append(materialIdxs, tmp...)
+			}
+		}
+	}
+
+	bonesEnabled := !cfg.Model.NoBones
+
+	var skin *uint32 = nil
+	var parent *uint32 = nil
+	if bonesEnabled && len(unitInfo.Bones) > 2 {
+		skin = gltf.Index(AddSkeleton(ctx, doc, unitInfo, armorSetName, passive))
+		parent = doc.Skins[*skin].Skeleton
+		if cfg.Model.EnableAnimations {
+			index, err := state_machine.AddStateMachine(ctx, doc, unitInfo)
+			if err != nil {
+				return fmt.Errorf("add state machine: %v", err)
+			}
+			if index >= 0 {
+				extras, ok := doc.Nodes[*parent].Extras.(map[string]any)
+				if !ok {
+					extras = make(map[string]any)
+				}
+				extras["state_machine"] = index
+				doc.Nodes[*parent].Extras = extras
+			}
+		}
+		AddLights(ctx, doc, unitInfo, parent)
+	} else {
+		parent = gltf.Index(uint32(len(doc.Nodes)))
+		doc.Nodes = append(doc.Nodes, &gltf.Node{
+			Name: ctx.FileID().Name.String(),
+		})
+		doc.Scenes[0].Nodes = append(doc.Scenes[0].Nodes, *parent)
+		if armorSetName != nil {
+			extras := map[string]any{"armorSet": *armorSetName}
+			doc.Nodes[*parent].Extras = extras
+		}
+	}
+
+	var meshNodes []uint32 = make([]uint32, 0)
+
+	if unitInfo.GeometryGroup.Value != 0x0 {
+		err := loadGeometryGroupMeshes(ctx, doc, unitInfo, &meshNodes, materialIdxs, *parent, skin)
+		if err != nil && err != ErrGeometryGroupMissing {
+			return err
+		} else if err != nil {
+			for i := range unitInfo.MeshInfos {
+				// Post process data:
+				//   * Reorient in gltf space and align position with group matrix
+				//   * Remap raw joints using skeleton maps
+				//   * Flip normals if reorientation changed winding order of vertices
+				//   * Separate UDIMs
+				var meshHeader unit.MeshHeader
+				for _, meshInfo := range unitInfo.MeshInfos {
+					if meshInfo.Header.MeshName == unitInfo.GroupBones[i] {
+						meshHeader = meshInfo.Header
+						break
+					}
+				}
+				bboxNode := make([]uint32, 0)
+				geometry.AddBoundingBoxWithTransform(doc, ctx.LookupThinHash(unitInfo.GroupBones[i]), meshHeader, unitInfo, &bboxNode, mgl32.Ident4())
+				doc.Nodes[*parent].Children = append(doc.Nodes[*parent].Children, bboxNode...)
+			}
+		}
+	} else {
+		meshInfos := make([]geometry.MeshInfo, 0)
+		for _, info := range unitInfo.MeshInfos {
+			meshInfos = append(meshInfos, geometry.MeshInfo{
+				Groups:          info.Groups,
+				Materials:       info.Materials,
+				MeshLayoutIndex: uint32(info.Header.LayoutIdx),
+			})
+		}
+
+		err := geometry.LoadGLTF(ctx, fGPU, doc, meshInfos, unitInfo.GroupBones, unitInfo.MeshLayouts, unitInfo, &meshNodes, materialIdxs, *parent, skin)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(unitInfo.TerrainInfos) > 0 {
+		doc.Nodes[*parent].Children = append(doc.Nodes[*parent].Children, AddTerrain(ctx, doc, unitInfo, &meshNodes)...)
+	}
+
+	AddPrefabMetadata(ctx, doc, parent, skin, meshNodes, armorSetName)
+
+	if gltfDoc == nil {
+		err := extractor.SaveDocument(ctx, doc, "unit", cfg.Model.Format)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var ErrGeometryGroupMissing error = errors.New("geometry_group does not exist")
+
+func loadGeometryGroupMeshes(ctx *extractor.Context, doc *gltf.Document, unitInfo *unit.Info, meshNodes *[]uint32, materialIndices []geometry.MaterialVariantMap, parent uint32, skin *uint32) error {
+	geoID := stingray.NewFileID(unitInfo.GeometryGroup, stingray.Sum("geometry_group"))
+	f, err := ctx.Open(geoID, stingray.DataMain)
+	if err == stingray.ErrFileNotExist {
+		return ErrGeometryGroupMissing
+	}
+	if err != nil {
+		return err
+	}
+
+	geoGroup, err := geometrygroup.LoadGeometryGroup(f)
+	if err != nil {
+		return err
+	}
+
+	geoInfo, ok := geoGroup.MeshInfos[ctx.FileID().Name]
+	unitName, contains := ctx.Hashes()[ctx.FileID().Name]
+	if !contains {
+		unitName = ctx.FileID().Name.String()
+	}
+	if !ok {
+		return fmt.Errorf("%v.geometry_group does not contain %v.unit", unitInfo.GeometryGroup.String(), unitName)
+	}
+
+	gpuR, err := ctx.Open(geoID, stingray.DataGPU)
+	if err != nil {
+		return err
+	}
+
+	meshInfos := make([]geometry.MeshInfo, 0)
+	for _, header := range geoInfo.MeshHeaders {
+		meshInfos = append(meshInfos, geometry.MeshInfo{
+			Groups:          header.Groups,
+			Materials:       header.Materials,
+			MeshLayoutIndex: header.MeshLayoutIndex,
+		})
+	}
+
+	return geometry.LoadGLTF(ctx, gpuR, doc, meshInfos, geoInfo.MeshNames, geoGroup.MeshLayouts, unitInfo, meshNodes, materialIndices, parent, skin)
+}
+
+func Convert(currDoc *gltf.Document) func(ctx *extractor.Context) error {
+	return func(ctx *extractor.Context) error {
+		opts, err := extr_material.GetImageOpts(ctx)
+		if err != nil {
+			return err
+		}
+		return ConvertOpts(ctx, opts, currDoc)
+	}
+}

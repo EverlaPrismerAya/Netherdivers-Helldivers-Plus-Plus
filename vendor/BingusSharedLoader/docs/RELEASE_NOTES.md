@@ -1,0 +1,8 @@
+- The shared LuaJIT code cache now starts at 64 MB of machine code instead of 16 MB and can grow to 256 MB after a flush; unused space costs nothing.
+- New `after_startup`: a mod can run its setup once after every mod has started, so menu registrations no longer need retries.
+- The loader log now records the game's start, its build, each module's load time and heap growth, how the previous session ended and the newest crash dump's code and offset.
+- Another mod can no longer break loading, logs or discovery by replacing Lua builtins or redeclaring Windows functions: the loader keeps private copies and names.
+- When several archives hold the same mod, the log names the copy the game loads and the hidden ones.
+- Mods can test for loader features with `CowboyBingusModLoader.capabilities`; `version` stays 17, so existing mods see no change.
+- Tested in game: a clean run reached the ship and quit with every Vanilla Plus Megapack v37 option, and two missions of real play showed no cache flush (peak 1,344 KB of machine code).
+- Startup work only: still nothing per frame. Replace the previous loader entry in your mod manager, then Purge / Deploy.

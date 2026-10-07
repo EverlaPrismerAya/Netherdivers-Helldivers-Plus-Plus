@@ -1,0 +1,72 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+
+	datalib "github.com/xypwn/filediver/datalibrary"
+	"github.com/xypwn/filediver/hashes"
+	"github.com/xypwn/filediver/stingray"
+)
+
+type SimpleVisibilityMaskInfo struct {
+	Name        string `json:"name"`
+	Index       uint16 `json:"index"`
+	StartHidden bool   `json:"default_hidden"`
+}
+
+type SimpleVisibilityRandomization struct {
+	Identifier     string   `json:"id"`
+	MaskIndexNames []string `json:"mask_index_names,omitempty"`
+}
+
+type SimpleVisibilityMaskComponent struct {
+	MaskInfos      []SimpleVisibilityMaskInfo      `json:"mask_infos,omitempty"`
+	Randomizations []SimpleVisibilityRandomization `json:"randomizations,omitempty"`
+}
+
+func main() {
+	knownThinHashes := hashes.ParseHashes(hashes.ThinHashes)
+
+	thinHashesMap := make(map[stingray.ThinHash]string)
+	for _, h := range knownThinHashes {
+		thinHashesMap[stingray.Sum(h).Thin()] = h
+	}
+
+	lookupThinHash := func(hash stingray.ThinHash) string {
+		if name, ok := thinHashesMap[hash]; ok {
+			return name
+		}
+		return hash.String()
+	}
+
+	knownHashes := hashes.ParseHashes(hashes.Hashes)
+
+	hashesMap := make(map[stingray.Hash]string)
+	for _, h := range knownHashes {
+		hashesMap[stingray.Sum(h)] = h
+	}
+
+	lookupHash := func(hash stingray.Hash) string {
+		if name, ok := hashesMap[hash]; ok {
+			return name
+		}
+		return hash.String()
+	}
+
+	visibilityMasks, err := datalib.ParseVisibilityMasks()
+	if err != nil {
+		panic(err)
+	}
+
+	result := make(map[string]any)
+	for name, component := range visibilityMasks {
+		result[lookupHash(name)] = component.ToSimple(lookupHash, lookupThinHash, func(hash uint32) string { return "" })
+	}
+
+	output, err := json.MarshalIndent(result, "", "    ")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(string(output))
+}

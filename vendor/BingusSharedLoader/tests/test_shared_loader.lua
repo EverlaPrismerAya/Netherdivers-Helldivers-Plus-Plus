@@ -1,0 +1,169 @@
+local source, build = assert(arg[1]), assert(arg[2])
+local names = {'mods/cowboybingus/better_stratagem_bounce', 'mods/cowboybingus/hellpod_steering_unlocked',
+               'mods/cowboybingus/wide_angle_stratagems', 'mods/cowboybingus/reinforcement_beacon_fix_data',
+               'mods/cowboybingus/consistent_vaulting', 'mods/cowboybingus/shallow_water_dive',
+               'mods/cowboybingus/sentry_aim_retention', 'mods/codex/gun_calibration',
+               'mods/cowboybingus/vanilla_plus_megapack', 'mods/cowboybingus/corpse_collision_repair', 'mods/cowboybingus/vehicle_stability', 'mods/cowboybingus/hover_pack_cancel', 'mods/cowboybingus/enemy_intelligence', 'mods/cowboybingus/armory_preview_cache'}
+
+local function environment(audio)
+    local env = setmetatable({print = function() end, os = {getenv = function() end},
+        stingray = {Application = {build = function() return 'release' end}}}, {__index = _G})
+    env._G = env
+    if audio then env.stingray.Wwise = {} end
+    env.loadstring = function(bytes, name)
+        local chunk, reason = loadstring(bytes, name)
+        if chunk then setfenv(chunk, env) end
+        return chunk, reason
+    end
+    return env
+end
+
+local function execute(path, env)
+    return setfenv(assert(loadfile(path)), env)()
+end
+
+for _, audio in ipairs({false, true}) do
+  for mask = 0, 16383 do
+    for _, failure in ipairs({'none', 'lookup', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth', 'eleventh', 'twelfth', 'thirteenth', 'fourteenth'}) do
+        local env, vanilla = environment(audio), environment(audio)
+        local count, updates, hud_updates = {}, 0, 0
+        local function required(name)
+            assert(name == 'core/wwise/lua/wwise_visualization' or name == 'core/wwise/lua/wwise_bank_reference')
+            return {}
+        end
+        vanilla.require = required
+        execute(build .. '/vanilla-callbacks.ljbc', vanilla)
+        execute(build .. '/vanilla-boot.ljbc', env)
+        local original_init, original_shutdown = env.init, env.shutdown
+        env.update = function(dt, marker)
+            assert(dt == 0.1 and marker == 'marker')
+            updates = updates + 1
+            return 1, nil, 3
+        end
+        local present = {}
+        for i, name in ipairs(names) do present[name] = math.floor(mask / 2^(i-1)) % 2 == 1 end
+        env.stingray.Application.can_get = function(kind, name)
+            assert(kind == 'lua' and present[name] ~= nil)
+            if failure == 'lookup' then error('lookup failure') end
+            return present[name]
+        end
+        env.require = function(name)
+            if name == 'core/wwise/lua/wwise_flow_callbacks' then
+                execute(build .. '/callbacks.ljbc', env)
+                return true
+            end
+            if present[name] ~= nil then
+                assert(present[name], 'Missing resource reached require')
+                count[name] = (count[name] or 0) + 1
+                if failure == 'first' and name == names[1] or failure == 'second' and name == names[2]
+                    or failure == 'third' and name == names[3] or failure == 'fourth' and name == names[4]
+                    or failure == 'fifth' and name == names[5] or failure == 'sixth' and name == names[6]
+                    or failure == 'seventh' and name == names[7] or failure == 'eighth' and name == names[8]
+                    or failure == 'ninth' and name == names[9] or failure == 'tenth' and name == names[10] or failure == 'eleventh' and name == names[11] or failure == 'twelfth' and name == names[12]
+                    or failure == 'thirteenth' and name == names[13] or failure == 'fourteenth' and name == names[14] then
+                    error('module failure')
+                end
+                local previous = env.update
+                env.update = function(...) return previous(...) end
+                return true
+            end
+            return required(name)
+        end
+        env.init()
+        assert(env.CowboyBingusModLoader.version == 17 and env.CowboyBingusModLoader.api == 1)
+        local previous = env.update
+        env.update = function(...)
+            hud_updates = hud_updates + 1
+            return previous(...)
+        end
+        -- HUD+ installs another update wrapper after boot initialization.
+        execute(source .. '/shared_loader.lua', env)
+        local a, b, c = env.update(0.1, 'marker')
+        assert(a == 1 and b == nil and c == 3 and select('#', env.update(0.1, 'marker')) == 3)
+        assert(updates == 2 and hud_updates == 2 and env.init == original_init and env.shutdown == original_shutdown)
+        for name in pairs(env.CowboyBingusModLoader.modules) do
+            assert(present[name] ~= nil, 'Unexpected module reached the coordinator')
+        end
+        for _, name in ipairs(names) do
+            assert((count[name] or 0) == (present[name] and failure ~= 'lookup' and 1 or 0))
+            local status = env.CowboyBingusModLoader.modules[name]
+            assert(type(status) == 'string')
+            if failure == 'none' then assert(status == (present[name] and 'loaded' or 'not installed')) end
+        end
+        local callbacks = 0
+        for name, callback in pairs(vanilla.WwiseFlowCallbacks) do
+            assert(string.dump(callback, true) == string.dump(env.WwiseFlowCallbacks[name], true))
+            callbacks = callbacks + 1
+        end
+        assert(callbacks > 25)
+    end
+  end
+end
+local env = environment(false)
+execute(source .. '/shared_loader.lua', env)
+assert(env.CowboyBingusModLoader.modules[names[1]]:find('lookup failed', 1, true))
+
+-- The built coordinator raises the shared LuaJIT limits before any mod loads
+-- and adds no per-frame hook. The other runs above have no raw jit global:
+-- unmanaged.
+do
+    local env, events = environment(false), {}
+    rawset(env, 'jit', {opt = {start = function(...) events[#events + 1] = 'limits ' .. table.concat({...}, ' ') end},
+                        attach = function(_, event) events[#events + 1] = 'watch ' .. event end})
+    execute(build .. '/vanilla-boot.ljbc', env)
+    local update = function() end
+    env.update = update
+    env.stingray.Application.can_get = function(kind, name) return kind == 'lua' and name == names[9] end
+    env.require = function(name)
+        if name == 'core/wwise/lua/wwise_flow_callbacks' then
+            execute(build .. '/callbacks.ljbc', env)
+            return true
+        elseif name == names[9] then
+            events[#events + 1] = 'module'
+            return true
+        end
+        assert(name == 'core/wwise/lua/wwise_visualization' or name == 'core/wwise/lua/wwise_bank_reference')
+        return {}
+    end
+    env.init()
+    assert(events[1] == 'limits maxmcode=65536 maxtrace=8000' and events[2] == 'watch trace', events[1])
+    assert(events[3] == 'module' and #events == 3)
+    local jit_state = env.CowboyBingusModLoader.jit
+    assert(jit_state.managed and jit_state.expanded and jit_state.watcher and jit_state.menu == nil)
+    assert(env.update == update, 'The cache budget must not hook update')
+end
+
+-- Capabilities: what this build supports, for mods to test instead of comparing
+-- version. The built coordinator has them all, the bare source only api, logs and
+-- after_startup.
+-- They say what is supported, not how it went this session (here the cache is
+-- unmanaged and discovery fails). Read-only, and looked up through the metatable.
+do
+    local env = environment(false)
+    execute(build .. '/vanilla-boot.ljbc', env)
+    env.stingray.Application.can_get = function() return false end
+    env.require = function(name)
+        if name == 'core/wwise/lua/wwise_flow_callbacks' then
+            execute(build .. '/callbacks.ljbc', env)
+            return true
+        end
+        assert(name == 'core/wwise/lua/wwise_visualization' or name == 'core/wwise/lua/wwise_bank_reference')
+        return {}
+    end
+    env.init()
+    local loader = env.CowboyBingusModLoader
+    local built = loader.capabilities
+    assert(built.api == 1 and built.logs == true and built.discovery == true and built.jit_budget == true
+        and built.health == true and built.after_startup == true)
+    assert(loader.jit.managed == false and loader.discovery:find('^failed: '), 'status and capability mixed up')
+    assert(not pcall(function() built.health = false end) and built.health == true, 'capabilities writable')
+    assert(not pcall(function() built.extra = true end) and built.extra == nil, 'capabilities extendable')
+    assert(getmetatable(built) == false and not pcall(setmetatable, built, {}), 'capabilities metatable exposed')
+    assert(next(built) == nil, 'capabilities stored as fields')
+    local bare = environment(false)
+    execute(source .. '/shared_loader.lua', bare)
+    local direct = bare.CowboyBingusModLoader.capabilities
+    assert(direct.api == 1 and direct.logs == true and direct.discovery == false and direct.jit_budget == false
+        and direct.health == false and direct.after_startup == true)
+end
+print('PASS: shared coordinator covers all 16384 mod combinations, lookup/module failure isolation, duplicate loads, update returns, original audio callbacks, the shared LuaJIT cache start order and read-only capabilities')

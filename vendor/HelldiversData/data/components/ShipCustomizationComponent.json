@@ -1,0 +1,3 @@
+{ "ShipCustomizationComponent" : {
+    "mesh_progression_tracks" : { "type": "array", "subtype": "ShipCustomizationMeshProgressionTrack", "description": "Mesh progression track entries." }
+}}

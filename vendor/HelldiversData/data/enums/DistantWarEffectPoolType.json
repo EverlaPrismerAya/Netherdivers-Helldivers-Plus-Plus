@@ -1,0 +1,9 @@
+{ "DistantWarEffectPoolType": [
+    "DistantWarEffectPoolType_Neutral",
+    "DistantWarEffectPoolType_Bugs",
+    "DistantWarEffectPoolType_Cyborg",
+    "DistantWarEffectPoolType_Illuminate",
+    "DistantWarEffectPoolType_Tutorial",
+    "DistantWarEffectPoolType_DSS_Eagle",
+    "DistantWarEffectPoolType_Count"
+]}

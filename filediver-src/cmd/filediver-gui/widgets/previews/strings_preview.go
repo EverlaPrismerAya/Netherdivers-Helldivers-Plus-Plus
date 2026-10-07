@@ -1,0 +1,98 @@
+package previews
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"unicode"
+
+	"github.com/AllenDang/cimgui-go/imgui"
+	fnt "github.com/xypwn/filediver/cmd/filediver-gui/fonts"
+	"github.com/xypwn/filediver/cmd/filediver-gui/imutils"
+	"github.com/xypwn/filediver/cmd/filediver-gui/textutils"
+	"github.com/xypwn/filediver/stingray"
+	stingray_strings "github.com/xypwn/filediver/stingray/strings"
+)
+
+type StringsPreview struct {
+	queryBuf             string
+	shownIDs             []uint32
+	languageNameOrHash   string
+	languageFriendlyName string
+	strings              map[uint32]string
+	needCJKFont          bool
+}
+
+func NewStringsPreview() *StringsPreview {
+	return &StringsPreview{}
+}
+
+func (pv *StringsPreview) Load(data *stingray_strings.Strings, thinhashes map[stingray.ThinHash]string) {
+	pv.queryBuf = ""
+	pv.strings = data.Strings
+	pv.updateShownIDs()
+	if n, ok := thinhashes[data.Language]; ok {
+		pv.languageNameOrHash = n
+	} else {
+		pv.languageNameOrHash = data.Language.String()
+	}
+	if data.Count == 0 {
+		pv.languageFriendlyName = "None"
+	} else if fn, ok := stingray_strings.LanguageHashToFriendlyName[data.Language]; ok {
+		pv.languageFriendlyName = fn
+	} else {
+		pv.languageFriendlyName = "Unknown"
+	}
+	for _, v := range pv.strings {
+		if strings.ContainsFunc(v, func(r rune) bool {
+			// NOTE(xypwn): This isn't 100% accurate, but it should be good enough for our use case.
+			return unicode.In(r, unicode.Unified_Ideograph, unicode.Hiragana, unicode.Katakana, unicode.Hangul)
+		}) {
+			pv.needCJKFont = true
+		}
+	}
+}
+
+func (pv *StringsPreview) NeedCJKFont() bool {
+	return pv.needCJKFont
+}
+
+func (pv *StringsPreview) updateShownIDs() {
+	pv.shownIDs = pv.shownIDs[:0]
+	for _, id := range slices.Sorted(maps.Keys(pv.strings)) {
+		if textutils.QueryMatchesAny(pv.queryBuf,
+			fmt.Sprint(id), pv.strings[id]) {
+			pv.shownIDs = append(pv.shownIDs, id)
+		}
+	}
+}
+
+func (pv *StringsPreview) Draw() {
+	imgui.SetNextItemWidth(imgui.ContentRegionAvail().X)
+	if imgui.InputTextWithHint("##Search Strings", fnt.I.Search+" Filter by ID or string...", &pv.queryBuf, 0, nil) {
+		pv.updateShownIDs()
+	}
+
+	imutils.Textf("Language: %v [%v]", pv.languageFriendlyName, pv.languageNameOrHash)
+
+	const tableFlags = imgui.TableFlagsResizable | imgui.TableFlagsBorders | imgui.TableFlagsScrollY | imgui.TableFlagsRowBg
+	if imgui.BeginTableV("##Strings Preview", 2, tableFlags, imgui.NewVec2(0, 0), 0) {
+		imgui.TableSetupColumnV("ID", imgui.TableColumnFlagsWidthStretch, 1, 0)
+		imgui.TableSetupColumnV("String", imgui.TableColumnFlagsWidthStretch, 2, 0)
+		imgui.TableSetupScrollFreeze(0, 1)
+		imgui.TableHeadersRow()
+
+		for _, key := range pv.shownIDs {
+			value := pv.strings[key]
+			imgui.PushIDInt(int32(key))
+			imgui.TableNextColumn()
+			imutils.CopyableTextf("%v##key", key)
+			imgui.TableNextColumn()
+			imgui.PushTextWrapPos()
+			imutils.CopyableTextf("%v##value", value)
+			imgui.PopID()
+		}
+		imgui.EndTable()
+	}
+}

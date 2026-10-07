@@ -1,0 +1,116 @@
+package geometry_group
+
+import (
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/qmuntal/gltf"
+	"github.com/xypwn/filediver/extractor"
+	"github.com/xypwn/filediver/extractor/geometry"
+	extr_material "github.com/xypwn/filediver/extractor/material"
+	extr_unit "github.com/xypwn/filediver/extractor/unit"
+	"github.com/xypwn/filediver/stingray"
+	"github.com/xypwn/filediver/stingray/unit"
+	geometrygroup "github.com/xypwn/filediver/stingray/unit/geometry_group"
+)
+
+func ConvertOpts(ctx *extractor.Context, imgOpts *extr_material.ImageOptions, gltfDoc *gltf.Document) error {
+	cfg := ctx.Config()
+
+	fMain, err := ctx.Open(ctx.FileID(), stingray.DataMain)
+	if err != nil {
+		return err
+	}
+	var fGPU io.ReadSeeker
+	if ctx.Exists(ctx.FileID(), stingray.DataGPU) {
+		fGPU, err = ctx.Open(ctx.FileID(), stingray.DataGPU)
+		if err != nil {
+			return err
+		}
+	}
+
+	geoGroup, err := geometrygroup.LoadGeometryGroup(fMain)
+	if err != nil {
+		return err
+	}
+
+	doc := extractor.GetDocument(ctx, gltfDoc)
+
+	for unitHash, meshInfo := range geoGroup.MeshInfos {
+		unitId := ctx.OverrideAsset(stingray.NewFileID(unitHash, stingray.Sum("unit")))
+		f, err := ctx.Open(unitId, stingray.DataMain)
+		if err == stingray.ErrFileNotExist {
+			return fmt.Errorf("%v.unit does not exist", unitId.Name.String())
+		}
+		if err != nil {
+			return err
+		}
+
+		unitInfo, err := unit.LoadInfo(f)
+		if err != nil {
+			return err
+		}
+
+		// Load materials
+		materialIdxs, err := extr_unit.AddMaterials(ctx.WithFileID(unitId), doc, imgOpts, unitInfo, nil)
+		if err != nil {
+			return err
+		}
+
+		bonesEnabled := !cfg.Model.NoBones
+
+		var skin *uint32 = nil
+		var parent *uint32 = nil
+		if bonesEnabled && len(unitInfo.Bones) > 2 {
+			skin = gltf.Index(extr_unit.AddSkeleton(ctx.WithFileID(unitId), doc, unitInfo, nil, nil))
+			parent = doc.Skins[*skin].Skeleton
+		} else {
+			unitName := ctx.LookupHash(unitHash)
+			if strings.Contains(unitName, "/") {
+				items := strings.Split(unitName, "/")
+				unitName = items[len(items)-1]
+			}
+			parent = gltf.Index(uint32(len(doc.Nodes)))
+			doc.Nodes = append(doc.Nodes, &gltf.Node{
+				Name: unitName,
+			})
+			doc.Scenes[0].Nodes = append(doc.Scenes[0].Nodes, *parent)
+		}
+
+		meshInfos := make([]geometry.MeshInfo, 0)
+		for _, header := range meshInfo.MeshHeaders {
+			meshInfos = append(meshInfos, geometry.MeshInfo{
+				Groups:          header.Groups,
+				Materials:       header.Materials,
+				MeshLayoutIndex: header.MeshLayoutIndex,
+			})
+		}
+
+		var meshNodes []uint32 = make([]uint32, 0)
+		err = geometry.LoadGLTF(ctx.WithFileID(unitId), fGPU, doc, meshInfos, meshInfo.MeshNames, geoGroup.MeshLayouts, unitInfo, &meshNodes, materialIdxs, *parent, skin)
+		if err != nil {
+			return err
+		}
+		extr_unit.AddPrefabMetadata(ctx.WithFileID(unitId), doc, parent, skin, meshNodes, nil)
+	}
+
+	if gltfDoc == nil {
+		err := extractor.SaveDocument(ctx, doc, "geometry_group", cfg.Model.Format)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func Convert(currDoc *gltf.Document) func(ctx *extractor.Context) error {
+	return func(ctx *extractor.Context) error {
+		opts, err := extr_material.GetImageOpts(ctx)
+		if err != nil {
+			return err
+		}
+		return ConvertOpts(ctx, opts, currDoc)
+	}
+}

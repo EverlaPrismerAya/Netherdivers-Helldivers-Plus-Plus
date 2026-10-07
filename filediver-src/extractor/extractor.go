@@ -1,0 +1,244 @@
+package extractor
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/qmuntal/gltf"
+	"github.com/xypwn/filediver/extractor/blend_helper"
+	"github.com/xypwn/filediver/stingray"
+)
+
+type ExtractFunc func(ctx *Context) error
+
+func extractByType(ctx *Context, typ stingray.DataType, extension string) error {
+	r, err := ctx.Open(ctx.FileID(), typ)
+	if err != nil {
+		return err
+	}
+
+	var typExtension string
+	switch typ {
+	case stingray.DataMain:
+		typExtension = ".main"
+	case stingray.DataStream:
+		typExtension = ".stream"
+	case stingray.DataGPU:
+		typExtension = ".gpu"
+	default:
+		panic("unhandled case")
+	}
+	out, err := ctx.CreateFile("." + extension + typExtension)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, r); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func extractCombined(ctx *Context, extension string) error {
+	if !(ctx.Exists(ctx.FileID(), stingray.DataMain) || ctx.Exists(ctx.FileID(), stingray.DataStream) || ctx.Exists(ctx.FileID(), stingray.DataGPU)) {
+		return fmt.Errorf("extractCombined: no data to extract for file")
+	}
+	out, err := ctx.CreateFile(fmt.Sprintf(".%v", extension))
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	for _, typ := range [3]stingray.DataType{stingray.DataMain, stingray.DataStream, stingray.DataGPU} {
+		r, err := ctx.Open(ctx.FileID(), typ)
+		if err == stingray.ErrFileDataTypeNotExist {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(out, r); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ExtractFuncRaw(extension string) ExtractFunc {
+	return func(ctx *Context) error {
+		for _, typ := range [3]stingray.DataType{stingray.DataMain, stingray.DataStream, stingray.DataGPU} {
+			if ctx.Exists(ctx.FileID(), typ) {
+				if err := extractByType(ctx, typ, extension); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
+
+func ExtractFuncRawSingleType(extension string, typ stingray.DataType) ExtractFunc {
+	return func(ctx *Context) error {
+		if ctx.Exists(ctx.FileID(), typ) {
+			return extractByType(ctx, typ, extension)
+		}
+		return fmt.Errorf("no %v data found", typ.String())
+	}
+}
+
+func ExtractFuncRawCombined(extension string) ExtractFunc {
+	return func(ctx *Context) error {
+		return extractCombined(ctx, extension)
+	}
+}
+
+// Blender throws a hissy fit if a node is reachable from multiple places in a scene, so we need to remove
+// child nodes from the scene before saving.
+func ClearChildNodesFromScene(ctx *Context, doc *gltf.Document) {
+	nodesToDelete := make([]uint32, 0)
+	extras, ok := doc.Extras.(map[string]any)
+	if !ok {
+		ctx.Warnf("No extras in doc? (Should not happen unless nothing was exported)")
+		return
+	}
+	for _, node := range doc.Scenes[0].Nodes {
+		nodeMetadata, ok := doc.Nodes[node].Extras.(map[string]any)
+		if !ok {
+			continue
+		}
+		hashIface, contains := nodeMetadata["hash"]
+		if !contains {
+			ctx.Warnf("node %v in scene missing hash information", doc.Nodes[node].Name)
+			continue
+		}
+		hash, ok := hashIface.(string)
+		if !ok {
+			ctx.Warnf("node %v's hash could not be converted to string", doc.Nodes[node].Name)
+			continue
+		}
+		metadataIface, contains := extras[hash]
+		if !contains {
+			ctx.Warnf("node %v's metadata was not present in doc extras", doc.Nodes[node].Name)
+			continue
+		}
+		metadata, ok := metadataIface.(map[string]any)
+		if !ok {
+			ctx.Warnf("node %v's metadata could not be converted", doc.Nodes[node].Name)
+			continue
+		}
+		parentIface, contains := metadata["parent"]
+		if !contains {
+			ctx.Warnf("node %v in scene missing parent information", doc.Nodes[node].Name)
+			continue
+		}
+		if _, ok := parentIface.(uint32); ok {
+			// parent can be converted to uint32, meaning this node is a child node of some other node
+			nodesToDelete = append(nodesToDelete, node)
+		}
+	}
+	for _, node := range nodesToDelete {
+		idx := slices.Index(doc.Scenes[0].Nodes, node)
+		if idx < 0 {
+			continue
+		}
+		doc.Scenes[0].Nodes = append(doc.Scenes[0].Nodes[:idx], doc.Scenes[0].Nodes[idx+1:]...)
+	}
+}
+
+func GetDocument(ctx *Context, inDoc *gltf.Document) *gltf.Document {
+	if inDoc != nil {
+		return inDoc
+	}
+	doc := gltf.NewDocument()
+	doc.Asset.Generator = "https://github.com/xypwn/filediver"
+	if ctx.BuildInfo() != nil {
+		doc.Scenes[0].Extras = map[string]any{"Helldivers 2 Version": ctx.BuildInfo().Version}
+	}
+	doc.Samplers = append(doc.Samplers, &gltf.Sampler{
+		MagFilter: gltf.MagLinear,
+		MinFilter: gltf.MinLinear,
+		WrapS:     gltf.WrapRepeat,
+		WrapT:     gltf.WrapRepeat,
+	})
+	return doc
+}
+
+func SaveDocument(ctx *Context, doc *gltf.Document, stingrayFormat, fileFormat string) error {
+	extras, ok := doc.Extras.(map[string]any)
+	if ok {
+		for key := range extras {
+			if strings.HasSuffix(key, ".geometry_group cache") {
+				delete(extras, key)
+			}
+		}
+		doc.Extras = extras
+	}
+	ctx.Statusf("Creating %v file...", fileFormat)
+	if fileFormat == "glb" {
+		name, err := ctx.AllocateFile(fmt.Sprintf(".%v.glb", stingrayFormat))
+		if err != nil {
+			return err
+		}
+		out, err := os.Create(name)
+		if err != nil {
+			return err
+		}
+		folder := filepath.Dir(name)
+		for idx := range doc.Buffers {
+			if idx == 0 {
+				continue
+			}
+			bufName, err := ctx.AllocateFile(fmt.Sprintf(".%v.%v.bin", stingrayFormat, idx))
+			if err != nil {
+				return err
+			}
+			uri, err := filepath.Rel(folder, bufName)
+			if err != nil {
+				return err
+			}
+			doc.Buffers[idx].URI = uri
+		}
+		enc := gltf.NewEncoder(out)
+		if err := enc.Encode(doc); err != nil {
+			return err
+		}
+	} else if fileFormat == "gltf" {
+		name, err := ctx.AllocateFile(fmt.Sprintf(".%v.gltf", stingrayFormat))
+		if err != nil {
+			return err
+		}
+		folder := filepath.Dir(name)
+		for idx := range doc.Buffers {
+			bufName, err := ctx.AllocateFile(fmt.Sprintf(".%v.%v.bin", stingrayFormat, idx))
+			if err != nil {
+				return err
+			}
+			uri, err := filepath.Rel(folder, bufName)
+			if err != nil {
+				return err
+			}
+			doc.Buffers[idx].URI = uri
+		}
+		if err := gltf.Save(doc, name); err != nil {
+			return err
+		}
+	} else if fileFormat == "blend" {
+		outPath, err := ctx.AllocateFile(fmt.Sprintf(".%v.blend", stingrayFormat))
+		if err != nil {
+			return err
+		}
+		err = blend_helper.ExportBlend(doc, outPath, ctx.Runner())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
